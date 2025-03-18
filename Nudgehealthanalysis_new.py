@@ -773,15 +773,21 @@ def process_diagnosis_data(df):
                         
                         long_df['diagnosis_text'] = long_df.apply(get_text_for_diagnosis, axis=1)
             
-            # Clean up diagnosis codes and assign domains
+            # Assign clinical domain for each diagnosis
             long_df['diagnosis'] = long_df['diagnosis'].astype(str).str.strip().str.upper()
             
+            # Clean diagnosis codes for better pattern matching (remove punctuation)
+            long_df['clean_code'] = long_df['diagnosis'].str.replace('.', '').str.strip()
+            
             # Assign clinical domain for each diagnosis
-            long_df['domain'] = long_df['diagnosis'].apply(assign_clinical_domain)
+            long_df['domain'] = long_df['clean_code'].apply(assign_clinical_domain)
             
             # Clean up the final dataframe
             if 'diagnosis_column' in long_df.columns:
                 long_df.drop('diagnosis_column', axis=1, inplace=True)
+            
+            # Drop temporary column
+            long_df.drop('clean_code', axis=1, inplace=True)
             
             # Rename 'diagnosis' to 'condition' for consistency
             long_df.rename(columns={'diagnosis': 'condition'}, inplace=True)
@@ -1593,28 +1599,87 @@ def assign_clinical_domain(icd_code: str) -> str:
     return "Other"
 
 def create_domain_network(domain_df: pd.DataFrame) -> nx.Graph:
-    """Create a network of clinical domains and conditions."""
+    """
+    Create a network of conditions based on co-occurrence in patients.
+    
+    Args:
+        domain_df: DataFrame with patient diagnoses and domains
+        
+    Returns:
+        NetworkX Graph with conditions as nodes and co-occurrence as edges
+    """
     try:
         G = nx.Graph()
         
-        # Add nodes for each unique condition
+        # Ensure we have data and required columns
+        if domain_df is None or domain_df.empty:
+            logger.warning("No data provided for network creation")
+            return G
+            
+        if 'patient_id' not in domain_df.columns or 'condition' not in domain_df.columns:
+            logger.warning("Required columns missing from input data")
+            return G
+        
+        # Get unique conditions and add as nodes
         conditions = domain_df['condition'].unique()
-        G.add_nodes_from(conditions)
+        logger.info(f"Adding {len(conditions)} nodes to network")
         
-        # Create edges between conditions that occur in the same patient
-        for patient_id in domain_df['patient_id'].unique():
-            patient_conditions = domain_df[domain_df['patient_id'] == patient_id]['condition'].tolist()
-            for i in range(len(patient_conditions)):
-                for j in range(i + 1, len(patient_conditions)):
-                    if G.has_edge(patient_conditions[i], patient_conditions[j]):
-                        G[patient_conditions[i]][patient_conditions[j]]['weight'] += 1
+        # Add each condition as a node with its domain as attribute
+        for condition in conditions:
+            # Get the most common domain for this condition
+            domain_counts = domain_df[domain_df['condition'] == condition]['domain'].value_counts()
+            domain = domain_counts.index[0] if len(domain_counts) > 0 else 'Other'
+            G.add_node(condition, domain=domain)
+        
+        # Group by patient to find co-occurring conditions
+        patient_conditions = domain_df.groupby('patient_id')['condition'].apply(list).reset_index()
+        
+        # Add edges for co-occurring conditions
+        edge_weights = {}
+        
+        # Create progress counter
+        progress_counter = 0
+        total_patients = len(patient_conditions)
+        
+        for _, row in patient_conditions.iterrows():
+            # Update progress counter
+            progress_counter += 1
+            if progress_counter % 100 == 0:
+                logger.info(f"Processing edges: {progress_counter}/{total_patients} patients")
+                
+            conditions_list = row['condition']
+            
+            # Only process if patient has multiple conditions
+            if len(conditions_list) < 2:
+                continue
+                
+            # Create all pairwise combinations of conditions
+            for i in range(len(conditions_list)):
+                for j in range(i+1, len(conditions_list)):
+                    condition1 = conditions_list[i]
+                    condition2 = conditions_list[j]
+                    
+                    # Skip identical conditions
+                    if condition1 == condition2:
+                        continue
+                        
+                    # Create a unique key for this pair (order doesn't matter)
+                    edge_key = tuple(sorted([condition1, condition2]))
+                    
+                    if edge_key in edge_weights:
+                        edge_weights[edge_key] += 1
                     else:
-                        G.add_edge(patient_conditions[i], patient_conditions[j], weight=1)
+                        edge_weights[edge_key] = 1
         
+        # Add edges to the graph with weights
+        logger.info(f"Adding {len(edge_weights)} edges to network")
+        for (condition1, condition2), weight in edge_weights.items():
+            G.add_edge(condition1, condition2, weight=weight)
+            
         return G
-        
+    
     except Exception as e:
-        logger.error(f"Error in create_domain_network: {str(e)}")
+        logger.error(f"Error creating domain network: {str(e)}")
         return nx.Graph()
 
 def calculate_condition_correlations(domain_df, method='pearson'):
@@ -1707,170 +1772,148 @@ def create_correlation_network(corr_matrix, threshold=0.3):
 
 def visualize_network_with_communities(G, domain_df):
     """
-    Create an interactive network visualization with community detection.
+    Visualize the condition network with communities and domain coloring.
     
     Args:
-        G: NetworkX graph object
-        domain_df: DataFrame with domain information
+        G: NetworkX graph of conditions
+        domain_df: DataFrame containing domain information
         
     Returns:
         Plotly figure object
     """
+    if G is None or G.number_of_nodes() == 0:
+        return None
+        
     try:
-        if G.number_of_nodes() == 0:
-            return None
-            
-        # Community detection using Louvain method
-        if COMMUNITY_DETECTION_AVAILABLE:
-            partition = community_louvain.best_partition(G)
-            communities = defaultdict(list)
-            for node, community_id in partition.items():
-                communities[community_id].append(node)
-            
-            # Get number of communities
-            num_communities = len(communities)
-            logger.info(f"Detected {num_communities} communities in the network")
-        else:
-            # Fallback if community detection not available
-            partition = {node: 0 for node in G.nodes()}
-            communities = {0: list(G.nodes())}
-            num_communities = 1
-            logger.warning("Community detection package not available. Using single community.")
+        # Set up domain colors
+        domain_colors = {
+            'Cardiometabolic': '#e41a1c',         # Red
+            'Immune-Inflammation': '#377eb8',     # Blue
+            'Oncological': '#4daf4a',             # Green
+            'Neuro-Mental Health': '#984ea3',     # Purple
+            'Neurological-Frailty': '#ff7f00',    # Orange
+            'SDOH': '#ffff33',                    # Yellow
+            'Other': '#999999'                    # Gray
+        }
         
-        # Create a layout for the network
+        # Position nodes using force-directed layout
+        pos = None
+        
+        # Try to use nx.spring_layout but handle potential issues
         try:
-            # Use force-directed layout
-            pos = nx.spring_layout(G, k=0.15, seed=42)
-        except:
-            # Fallback to alternative layout
-            pos = nx.kamada_kawai_layout(G)
-            
-        # Get node information
-        node_x = []
-        node_y = []
-        node_text = []
-        node_size = []
-        node_color = []
+            # Use spring layout with fixed parameters for better visualization
+            pos = nx.spring_layout(G, k=0.15, iterations=50, seed=42)
+            logger.info("Using spring layout for network visualization")
+        except Exception as e:
+            logger.warning(f"Error with spring layout: {str(e)}")
+            # Fall back to simpler layout
+            pos = nx.random_layout(G)
+            logger.info("Falling back to random layout")
         
+        # Create edge traces with width based on weight
+        edge_trace = []
+        
+        # Process edges and get the max weight for scaling
+        max_weight = 1
+        for u, v, data in G.edges(data=True):
+            weight = data.get('weight', 1)
+            max_weight = max(max_weight, weight)
+            
+        # Create edge traces
+        for u, v, data in G.edges(data=True):
+            # Get positions
+            x0, y0 = pos[u]
+            x1, y1 = pos[v]
+            
+            # Scale weight for visual width (min 1, max 10)
+            weight = data.get('weight', 1)
+            scaled_width = 1 + (weight / max_weight) * 9
+            
+            # Create edge trace
+            trace = go.Scatter(
+                x=[x0, x1, None],
+                y=[y0, y1, None],
+                mode='lines',
+                line=dict(width=scaled_width, color='rgba(180,180,180,0.7)'),
+                hoverinfo='none'
+            )
+            edge_trace.append(trace)
+        
+        # Create node traces by domain for more efficient plotting and better coloring
+        domain_node_traces = {}
+        domain_counts = {}
+        
+        # Initialize a node trace for each domain
+        for domain, color in domain_colors.items():
+            domain_node_traces[domain] = go.Scatter(
+                x=[],
+                y=[],
+                text=[],
+                mode='markers',
+                name=domain,
+                marker=dict(
+                    color=color,
+                    size=15,
+                    line=dict(width=1, color='#888')
+                ),
+                hoverinfo='text'
+            )
+            domain_counts[domain] = 0
+        
+        # Add nodes to their respective domain traces
         for node in G.nodes():
             x, y = pos[node]
-            node_x.append(x)
-            node_y.append(y)
             
-            # Get node degree and community
+            # Get node domain, degree, and weight for label
+            domain = G.nodes[node].get('domain', 'Other')
+            if domain not in domain_colors:
+                domain = 'Other'
+                
+            # Count domains
+            domain_counts[domain] += 1
+            
+            # Get node degree
             degree = G.degree(node)
-            community = partition.get(node, 0)
             
-            # Get domain for this condition
-            domain = assign_clinical_domain(node)
-            domain_formatted = domain.replace('_', ' ').title()
+            # Prepare hover text
+            hover_text = f"Condition: {node}<br>Domain: {domain}<br>Connections: {degree}"
             
-            # Node text for hover info
-            node_text.append(f"Condition: {node}<br>Degree: {degree}<br>Domain: {domain_formatted}<br>Community: {community}")
-            
-            # Node size based on degree
-            node_size.append(10 + degree * 2)
-            
-            # Node color based on community
-            node_color.append(community)
+            # Add to the appropriate domain trace
+            domain_node_traces[domain]['x'] = domain_node_traces[domain]['x'] + (x,)
+            domain_node_traces[domain]['y'] = domain_node_traces[domain]['y'] + (y,)
+            domain_node_traces[domain]['text'] = domain_node_traces[domain]['text'] + (hover_text,)
+            # Scale node size by degree (connections)
+            size = 10 + (degree * 2)
+            if 'marker.size' not in domain_node_traces[domain]:
+                domain_node_traces[domain]['marker']['size'] = []
+            domain_node_traces[domain]['marker']['size'] = domain_node_traces[domain]['marker']['size'] + (size,)
         
-        # Get edge information
-        edge_x = []
-        edge_y = []
-        edge_width = []
+        # Create a figure
+        fig = go.Figure(data=edge_trace + list(domain_node_traces.values()))
         
-        for edge in G.edges(data=True):
-            x0, y0 = pos[edge[0]]
-            x1, y1 = pos[edge[1]]
-            
-            # Add line endpoints
-            edge_x.extend([x0, x1, None])
-            edge_y.extend([y0, y1, None])
-            
-            # Edge width based on weight
-            weight = edge[2].get('weight', 1)
-            edge_width.append(1 + weight * 0.5)
+        # Filter out empty domains for the legend
+        active_domains = [domain for domain, count in domain_counts.items() if count > 0]
         
-        # Create edges trace
-        edge_trace = go.Scatter(
-            x=edge_x, y=edge_y,
-            line=dict(width=0.5, color='#888'),
-            hoverinfo='none',
-            mode='lines',
-            showlegend=False
+        # Create a better title with domain breakdown
+        domain_breakdown = ", ".join([f"{domain}: {count}" for domain, count in domain_counts.items() if count > 0])
+        title = f"Condition Network Map<br><sub>Domains: {domain_breakdown}</sub>"
+        
+        # Update layout
+        fig.update_layout(
+            title=title,
+            titlefont=dict(size=16),
+            showlegend=True,
+            legend=dict(title="Clinical Domains"),
+            hovermode='closest',
+            margin=dict(b=20, l=5, r=5, t=40),
+            xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+            yaxis=dict(showgrid=False, zeroline=False, showticklabels=False)
         )
-        
-        # Create nodes trace
-        node_trace = go.Scatter(
-            x=node_x, y=node_y,
-            mode='markers',
-            hoverinfo='text',
-            text=node_text,
-            marker=dict(
-                showscale=True,
-                colorscale='Viridis',
-                color=node_color,
-                size=node_size,
-                colorbar=dict(
-                    thickness=15,
-                    title='Community',
-                    xanchor='left',
-                    titleside='right'
-                ),
-                line=dict(width=1, color='#888')
-            )
-        )
-        
-        # Create figure
-        fig = go.Figure(data=[edge_trace, node_trace],
-                      layout=go.Layout(
-                          title='Condition Network with Communities',
-                          titlefont=dict(size=16),
-                          showlegend=False,
-                          hovermode='closest',
-                          margin=dict(b=20, l=5, r=5, t=40),
-                          xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
-                          yaxis=dict(showgrid=False, zeroline=False, showticklabels=False)
-                      ))
-        
-        # Add annotations for community descriptions
-        annotations = []
-        for community_id, nodes in communities.items():
-            if len(nodes) > 0:
-                # Get central position of this community
-                comm_x = sum(pos[node][0] for node in nodes if node in pos) / len(nodes)
-                comm_y = sum(pos[node][1] for node in nodes if node in pos) / len(nodes)
-                
-                # Get dominant domain in this community
-                domain_counts = {}
-                for node in nodes:
-                    domain = assign_clinical_domain(node)
-                    domain_counts[domain] = domain_counts.get(domain, 0) + 1
-                
-                dominant_domain = max(domain_counts, key=domain_counts.get)
-                domain_text = dominant_domain.replace('_', ' ').title()
-                
-                # Add annotation
-                annotations.append(
-                    dict(
-                        x=comm_x,
-                        y=comm_y,
-                        xref="x",
-                        yref="y",
-                        text=f"Community {community_id}<br>({domain_text})",
-                        showarrow=True,
-                        arrowhead=1,
-                        ax=0,
-                        ay=-40
-                    )
-                )
-        
-        fig.update_layout(annotations=annotations)
         
         return fig
         
     except Exception as e:
-        logger.error(f"Error in visualize_network_with_communities: {str(e)}")
+        logger.error(f"Error visualizing network: {str(e)}")
         return None
 
 def get_condition_severity(condition: str, biomarkers: dict = None) -> str:
@@ -1927,86 +1970,158 @@ def get_condition_severity(condition: str, biomarkers: dict = None) -> str:
 
 def calculate_total_risk_score(patient_data: dict) -> dict:
     """
-    Calculate total risk score based on conditions and network metrics using the NHCRS model.
+    Calculate the total risk score for a patient based on their conditions, biomarkers, etc.
     
     Args:
-        patient_data: Dictionary containing patient information including conditions
-        
+        patient_data: Dictionary containing patient information including:
+                     - conditions: list of conditions/diagnoses
+                     - age: patient age
+                     - gender: patient gender
+                     - biomarkers: dictionary of biomarker values
+                     - sdoh_data: dictionary of social determinants of health data
+                     
     Returns:
-        Dictionary containing risk score information
+        Dictionary containing:
+        - total_score: total NHCRS score
+        - domain_scores: dictionary of scores for each domain
+        - mortality_risk_10yr: 10-year mortality risk percentage
+        - hospitalization_risk_5yr: 5-year hospitalization risk percentage
     """
     try:
-        # Initialize domain scores
-        domain_scores = defaultdict(float)
-        
-        # Extract biomarker data if available
+        # Extract required data
+        conditions = patient_data.get('conditions', [])
+        age = patient_data.get('age', 0)
+        gender = patient_data.get('gender', 'Unknown')
         biomarkers = patient_data.get('biomarkers', {})
-        
-        # Extract SDOH data if available
         sdoh_data = patient_data.get('sdoh_data', {})
         
-        # Process each condition to calculate domain-specific scores
-        for condition in patient_data['conditions']:
-            domain = assign_clinical_domain(condition)
-            domain_score = calculate_domain_risk_score(
-                [condition], 
-                domain,
-                patient_data['age'],
-                patient_data['gender'],
-                biomarkers,
-                sdoh_data
-            )
-            domain_scores[domain] += domain_score
-        
-        # Apply network analysis modifier if available
-        network_multiplier = 1.0
-        if 'network_metrics' in patient_data:
-            if patient_data['network_metrics'].get('degree_centrality', 0) > 0.5:
-                network_multiplier += 0.2
-            if patient_data['network_metrics'].get('betweenness_centrality', 0) > 0.3:
-                network_multiplier += 0.1
-                
-        # Calculate NHCRS total score
-        nhcrs_total = calculate_nhcrs_total(dict(domain_scores))
-        
-        # Apply network multiplier
-        nhcrs_total *= network_multiplier
-        
-        # Calculate outcome probabilities
-        mortality_risk = calculate_mortality_risk(nhcrs_total)
-        hospitalization_risk = calculate_hospitalization_risk(nhcrs_total)
-        
-        # Convert to percentages
-        mortality_risk_pct = round(mortality_risk * 100, 1)
-        hospitalization_risk_pct = round(hospitalization_risk * 100, 1)
-        
-        # Determine risk level
-        risk_level = 'Low'
-        if nhcrs_total > 10:
-            risk_level = 'High'
-        elif nhcrs_total > 5:
-            risk_level = 'Medium'
-            
-        return {
-            'patient_id': patient_data.get('patient_id', 'Unknown'),
-            'total_score': nhcrs_total,
-            'risk_level': risk_level,
-            'domain_scores': dict(domain_scores),
-            'network_multiplier': network_multiplier,
-            'mortality_risk_10yr': mortality_risk_pct,
-            'hospitalization_risk_5yr': hospitalization_risk_pct
+        # Initialize default domain scores
+        domain_scores = {
+            'Cardiometabolic': 0.0,
+            'Immune-Inflammation': 0.0,
+            'Oncological': 0.0,
+            'Neuro-Mental Health': 0.0,
+            'Neurological-Frailty': 0.0,
+            'SDOH': 0.0
         }
         
-    except Exception as e:
-        logger.error(f"Error in calculate_total_risk_score: {str(e)}")
+        # Get domain counts if available
+        domain_condition_counts = patient_data.get('domain_condition_counts', {})
+        
+        # Skip risk calculation for patients with no conditions
+        if not conditions and not biomarkers:
+            # Return minimal risk scores
+            return {
+                'total_score': 1.0,  # Baseline score
+                'domain_scores': domain_scores,
+                'mortality_risk_10yr': 1.0,  # Baseline mortality risk
+                'hospitalization_risk_5yr': 0.5  # Baseline hospitalization risk
+            }
+        
+        # Calculate risk score for each domain
+        total_conditions = len(conditions)
+        
+        # Calculate risk score for each domain using conditions
+        if conditions:
+            for domain in domain_scores.keys():
+                # If we have precalculated domain counts, use them
+                if domain in domain_condition_counts:
+                    # Calculate proportion of conditions in this domain and scale to be more sensitive
+                    domain_proportion = domain_condition_counts[domain] / max(1, total_conditions)
+                    # Base domain risk on proportion and count
+                    condition_count = domain_condition_counts[domain]
+                    
+                    # Scale the score to make it more sensitive
+                    # Higher condition counts should have exponentially higher impact
+                    score_factor = 1.0  # Default factor
+                    if condition_count > 5:
+                        score_factor = 1.5
+                    elif condition_count > 10:
+                        score_factor = 2.0
+                    elif condition_count > 15:
+                        score_factor = 2.5
+                        
+                    # Use a more sensitive formula with increased weight for higher counts
+                    domain_score = (domain_proportion * 5.0) * math.sqrt(condition_count) * score_factor
+                    domain_scores[domain] = min(10.0, domain_score)  # Cap at 10.0
+                else:
+                    # Legacy calculation - calculate domain-specific risk
+                    domain_score = calculate_domain_risk_score(
+                        conditions, domain, age, gender, biomarkers, sdoh_data
+                    )
+                    domain_scores[domain] = domain_score
+        
+        # Enhance scores with biomarker data if available
+        if biomarkers:
+            # Add biomarker contributions to each domain
+            for domain in domain_scores.keys():
+                biomarker_score = calculate_biomarker_component(biomarkers, domain)
+                
+                # Add the biomarker score, but ensure we don't exceed max
+                domain_scores[domain] = min(10.0, domain_scores[domain] + biomarker_score)
+        
+        # Apply age and gender factors to each domain
+        for domain in domain_scores.keys():
+            gender_age_factor = get_gender_age_factor(domain, gender, age)
+            
+            # Apply the gender-age factor as a multiplier
+            domain_scores[domain] = min(10.0, domain_scores[domain] * gender_age_factor)
+            
+        # Apply SDOH modifiers if available
+        if sdoh_data:
+            for domain in domain_scores.keys():
+                sdoh_modifier = calculate_sdoh_modifier(sdoh_data, domain)
+                
+                # Apply the SDOH modifier
+                domain_scores[domain] = min(10.0, domain_scores[domain] * sdoh_modifier)
+        
+        # Calculate final NHCRS total score with weighted domain contributions
+        domain_weights = {
+            'Cardiometabolic': 0.25,          # High impact on mortality and hospitalization
+            'Immune-Inflammation': 0.15,      # Moderate impact
+            'Oncological': 0.25,              # High impact on mortality
+            'Neuro-Mental Health': 0.15,      # Moderate impact on hospitalization
+            'Neurological-Frailty': 0.15,     # Moderate impact, high in elderly
+            'SDOH': 0.05                      # Lower direct impact
+        }
+        
+        # Apply domain weights to calculate total score
+        weighted_score = 0.0
+        for domain, score in domain_scores.items():
+            weighted_score += score * domain_weights.get(domain, 0.0)
+            
+        # Add a network component if available
+        network_metrics = patient_data.get('network_metrics', {})
+        if network_metrics:
+            degree_cent = network_metrics.get('degree_centrality', 0)
+            betweenness_cent = network_metrics.get('betweenness_centrality', 0)
+            
+            # Add a network component to the score (0-2 points)
+            network_score = (degree_cent * 1.0) + (betweenness_cent * 1.0)
+            weighted_score += network_score
+        
+        # Get final NHCRS total (baseline + weighted contributions)
+        total_score = 1.0 + weighted_score  # Baseline of 1.0
+        
+        # Calculate mortality and hospitalization risks based on total score
+        mortality_risk = calculate_mortality_risk(total_score)
+        hospitalization_risk = calculate_hospitalization_risk(total_score)
+        
+        # Return results
         return {
-            'patient_id': patient_data.get('patient_id', 'Unknown'),
-            'total_score': 0,
-            'risk_level': 'Unknown',
-            'domain_scores': {},
-            'network_multiplier': 1.0,
-            'mortality_risk_10yr': 0.0,
-            'hospitalization_risk_5yr': 0.0
+            'total_score': total_score,
+            'domain_scores': domain_scores,
+            'mortality_risk_10yr': mortality_risk,
+            'hospitalization_risk_5yr': hospitalization_risk
+        }
+    
+    except Exception as e:
+        logger.error(f"Error calculating risk score: {str(e)}")
+        return {
+            'total_score': 1.0,
+            'domain_scores': {'Other': 1.0},
+            'mortality_risk_10yr': 1.0,
+            'hospitalization_risk_5yr': 0.5
         }
 
 def calculate_domain_risk_score(conditions: list, domain: str, patient_age: int, patient_gender: str, biomarkers: dict = None, sdoh_data: dict = None) -> float:
