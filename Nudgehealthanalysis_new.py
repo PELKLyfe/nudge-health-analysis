@@ -219,166 +219,267 @@ def fetch_biomarker_reference_data():
 
 def process_diagnosis_data(df):
     """
-    Process diagnosis data with unlimited diagnosis columns.
-    Handles both ICD-10 codes and descriptions using fuzzy matching for columns.
+    Process the input diagnosis data, handling both ICD-10 codes and text descriptions.
+    Transforms wide format diagnosis data into long format with domains assigned.
+    
+    Args:
+        df: DataFrame containing patient diagnosis data
+        
+    Returns:
+        Processed DataFrame in long format with domains assigned
     """
-    # Initialize lists for the long format data
-    records = []
-    
-    # Define target column names and their common variations
-    id_mappings = {
-        'patient_id': ['PatId', 'Pat Id', 'Patient ID', 'Patient Id', 'ID', 'PatID', 'Patient_ID', 'Patient Number'],
-        'gender': ['Gender', 'Sex', 'Gender/Sex', 'M/F'],
-        'age': ['Age', 'Patient Age', 'Years', 'Age (years)'],
-        'zip_code': ['Zip Code', 'ZIP', 'Postal Code', 'Postal', 'Zip']
-    }
-    
-    # Function to find the best column match using fuzzy matching
-    def find_best_column_match(target, possible_names):
-        # First try exact matches
-        found_col = next((col for col in df.columns if col in possible_names), None)
-        if found_col:
-            return found_col
-            
-        # Then try case-insensitive matches
-        found_col = next((col for col in df.columns 
-                          if col.lower() in [name.lower() for name in possible_names]), None)
-        if found_col:
-            return found_col
-            
-        if FUZZY_AVAILABLE:
-            # Use fuzzy matching for more flexible matching
-            best_match = None
-            best_score = 0
-            threshold = 80  # Minimum similarity score (0-100)
-            
-            for col in df.columns:
-                for name in possible_names:
-                    # Calculate similarity score
-                    score = fuzz.ratio(col.lower(), name.lower())
-                    
-                    # Check for partial matches too
-                    partial_score = fuzz.partial_ratio(col.lower(), name.lower())
-                    score = max(score, partial_score)
-                    
-                    # Update best match if score is higher
-                    if score > best_score and score >= threshold:
-                        best_match = col
-                        best_score = score
-            
-            if best_match:
-                logger.info(f"Fuzzy matched '{target}' to column '{best_match}' with score {best_score}")
-                return best_match
-        
-        # Fallback: Try removing spaces and special characters
-        stripped_cols = {col: re.sub(r'[^a-zA-Z0-9]', '', col.lower()) for col in df.columns}
-        stripped_targets = [re.sub(r'[^a-zA-Z0-9]', '', name.lower()) for name in possible_names]
-        
-        for col, stripped in stripped_cols.items():
-            if stripped in stripped_targets:
-                return col
-                
-        return None
-    
-    # Find best column matches for each target field
-    column_mapping = {}
-    for target, possible_names in id_mappings.items():
-        found_col = find_best_column_match(target, possible_names)
-        if found_col:
-            column_mapping[target] = found_col
-        else:
-            logger.warning(f"Could not find a match for {target} column")
-            
-    # Get diagnosis columns
-    diagnosis_cols = []
-    diagnosis_patterns = ['diagnosis', 'diag', 'dx', 'icd', 'condition']
-    
-    for col in df.columns:
-        # Check for diagnosis number pattern (Diagnosis 1, Diag 2, etc.)
-        if any(re.search(f"{pattern}\\s*\\d+", col.lower()) for pattern in diagnosis_patterns):
-            diagnosis_cols.append(col)
-            continue
-            
-        # Check for general diagnosis-related columns
-        if any(pattern in col.lower() for pattern in diagnosis_patterns):
-            diagnosis_cols.append(col)
-            continue
-            
-        # If fuzzy matching is available, check for fuzzy matches
-        if FUZZY_AVAILABLE:
-            for pattern in diagnosis_patterns:
-                if fuzz.partial_ratio(pattern, col.lower()) > 75:  # 75% similarity threshold
-                    diagnosis_cols.append(col)
-                    break
-    
-    # If no diagnosis columns found, try numbered columns as a fallback
-    if not diagnosis_cols:
-        # Look for numbered columns that might be diagnoses
-        numbered_cols = [col for col in df.columns 
-                        if re.search(r'\d+$', col) or any(c.isdigit() for c in col)]
-        if numbered_cols:
-            diagnosis_cols = numbered_cols
-            logger.warning(f"No diagnosis columns found, using numbered columns: {numbered_cols}")
-    
-    # Remove duplicates
-    diagnosis_cols = list(set(diagnosis_cols))
-    
-    # Sort diagnosis columns naturally if they contain numbers
     try:
-        def extract_number(col):
-            match = re.search(r'\d+', col)
-            return int(match.group()) if match else 0
+        # Make a copy to avoid modifying the original
+        df_copy = df.copy()
+        
+        # Standardize column names (case insensitive)
+        df_copy.columns = [col.lower() for col in df_copy.columns]
+        
+        # Map common column variations to standard names
+        column_mappings = {
+            'pat id': 'patid', 
+            'patient id': 'patid',
+            'patientid': 'patid',
+            'sex': 'gender',
+            'age_years': 'age',
+            'icd10': 'diagnosis',
+            'icd_10': 'diagnosis',
+            'icd code': 'diagnosis',
+            'icd-10 code': 'diagnosis',
+            'diagnosis code': 'diagnosis',
+            'condition': 'diagnosis_text',
+            'diagnosis description': 'diagnosis_text',
+            'description': 'diagnosis_text'
+        }
+        
+        # Apply column mappings where applicable
+        for old_col, new_col in column_mappings.items():
+            if old_col in df_copy.columns and new_col not in df_copy.columns:
+                df_copy.rename(columns={old_col: new_col}, inplace=True)
+        
+        # Function to find the best matching column for a target
+        def find_best_column_match(target, possible_names):
+            # First try exact matches
+            if target in df_copy.columns:
+                return target
             
-        diagnosis_cols.sort(key=extract_number)
-    except:
-        # Fall back to alphabetical sort
-        diagnosis_cols.sort()
+            # Then try partial matches
+            for col in df_copy.columns:
+                if any(name in col for name in possible_names):
+                    return col
+            
+            return None
+        
+        # Find diagnosis columns - both codes and text descriptions
+        diag_cols = []
+        text_cols = []
+        
+        # Check for dedicated diagnosis columns
+        diag_col = find_best_column_match('diagnosis', ['diagnosis', 'icd', 'code'])
+        if diag_col:
+            diag_cols.append(diag_col)
+        
+        # Check for diagnosis text/description columns
+        text_col = find_best_column_match('diagnosis_text', ['text', 'desc', 'condition'])
+        if text_col:
+            text_cols.append(text_col)
+        
+        # If no dedicated columns found, look for diagnosis1, diagnosis2, etc.
+        if not diag_cols:
+            diag_pattern = re.compile(r'(diagnosis|icd|dx).*?(\d+)', re.IGNORECASE)
+            for col in df_copy.columns:
+                if diag_pattern.search(col):
+                    diag_cols.append(col)
+        
+        # If no text description columns found, look for matching patterns
+        if not text_cols:
+            text_pattern = re.compile(r'(desc|text|condition).*?(\d+)', re.IGNORECASE)
+            for col in df_copy.columns:
+                if text_pattern.search(col):
+                    text_cols.append(col)
+        
+        # If still no diagnosis columns found, try to infer from data patterns
+        if not diag_cols:
+            for col in df_copy.columns:
+                # Sample values to check for ICD code patterns
+                sample_values = df_copy[col].dropna().astype(str).iloc[:10].tolist()
+                icd_pattern = re.compile(r'^[A-Z]\d{2}(\.\d+)?$')
+                if any(icd_pattern.match(val) for val in sample_values):
+                    diag_cols.append(col)
+        
+        # Ensure we have required columns
+        required_columns = ['patid', 'age', 'gender']
+        for col in required_columns:
+            if col not in df_copy.columns:
+                st.error(f"Missing required column: {col}")
+                return pd.DataFrame()
+        
+        # Create patient_id column if it doesn't exist
+        if 'patient_id' not in df_copy.columns:
+            if 'patid' in df_copy.columns:
+                df_copy['patient_id'] = df_copy['patid'].astype(str)
+            else:
+                st.error("No patient identifier column found")
+                return pd.DataFrame()
+        
+        # Process data into long format if in wide format
+        if diag_cols:
+            # Check if already in long format or wide format
+            if len(diag_cols) == 1 and df_copy[diag_cols[0]].notna().sum() == len(df_copy):
+                # Already in long format - just need to standardize
+                long_df = df_copy.copy()
+                long_df.rename(columns={diag_cols[0]: 'diagnosis'}, inplace=True)
+                
+                # Add diagnosis_text if available
+                if text_cols and len(text_cols) == 1:
+                    long_df.rename(columns={text_cols[0]: 'diagnosis_text'}, inplace=True)
+            else:
+                # Convert from wide to long format
+                id_vars = [col for col in df_copy.columns if col not in diag_cols + text_cols]
+                
+                # Process diagnosis codes
+                long_df = pd.melt(
+                    df_copy, 
+                    id_vars=id_vars,
+                    value_vars=diag_cols,
+                    var_name='diagnosis_column',
+                    value_name='diagnosis'
+                )
+                
+                # Drop rows with missing diagnoses
+                long_df = long_df[long_df['diagnosis'].notna()]
+                
+                # Extract diagnosis text if available and match with codes
+                if text_cols:
+                    # Create mapping between diagnosis columns and text columns
+                    text_mapping = {}
+                    
+                    # Try to match diagnosis1 with description1, etc.
+                    for diag_col in diag_cols:
+                        diag_num = re.search(r'(\d+)', diag_col)
+                        if diag_num:
+                            num = diag_num.group(1)
+                            for text_col in text_cols:
+                                if num in text_col:
+                                    text_mapping[diag_col] = text_col
+                                    break
+                    
+                    # Add text descriptions based on mapping
+                    if text_mapping:
+                        def get_text_for_diagnosis(row):
+                            diag_col = row['diagnosis_column']
+                            if diag_col in text_mapping:
+                                text_col = text_mapping[diag_col]
+                                return df_copy.loc[row.name, text_col]
+                            return None
+                        
+                        long_df['diagnosis_text'] = long_df.apply(get_text_for_diagnosis, axis=1)
+            
+            # Clean up diagnosis codes and assign domains
+            long_df['diagnosis'] = long_df['diagnosis'].astype(str).str.strip().str.upper()
+            
+            # Assign clinical domain for each diagnosis
+            long_df['domain'] = long_df['diagnosis'].apply(assign_clinical_domain)
+            
+            # Clean up the final dataframe
+            if 'diagnosis_column' in long_df.columns:
+                long_df.drop('diagnosis_column', axis=1, inplace=True)
+            
+            # Rename 'diagnosis' to 'condition' for consistency
+            long_df.rename(columns={'diagnosis': 'condition'}, inplace=True)
+            if 'diagnosis_text' in long_df.columns:
+                # If we have text descriptions and no valid ICD code in condition,
+                # use the text as the condition
+                mask = long_df['domain'] == 'Unknown'
+                if mask.any() and 'diagnosis_text' in long_df.columns:
+                    long_df.loc[mask, 'condition'] = long_df.loc[mask, 'diagnosis_text']
+                    # Try to assign domain based on text description
+                    long_df.loc[mask, 'domain'] = long_df.loc[mask, 'diagnosis_text'].apply(
+                        lambda x: assign_domain_from_text(x) if pd.notna(x) else 'Unknown'
+                    )
+            
+            # Filter out rows with Unknown domain if requested
+            # long_df = long_df[long_df['domain'] != 'Unknown']
+            
+            return long_df
+        else:
+            st.error("No diagnosis columns found in the data")
+            return pd.DataFrame()
     
-    if not diagnosis_cols:
-        logger.error(f"No diagnosis columns found in dataframe")
+    except Exception as e:
+        st.error(f"Error processing diagnosis data: {str(e)}")
+        logger.error(f"Error in process_diagnosis_data: {str(e)}")
         return pd.DataFrame()
-        
-    logger.info(f"Using diagnosis columns: {diagnosis_cols}")
+
+def assign_domain_from_text(text):
+    """
+    Assign a clinical domain based on text description when ICD code is not available.
     
-    # Process each row
-    for idx, row in df.iterrows():
-        # Create patient data with available fields
-        patient_data = {}
-        for target, col in column_mapping.items():
-            try:
-                patient_data[target] = row[col]
-            except:
-                patient_data[target] = "Unknown"
+    Args:
+        text: The diagnosis text description
         
-        # Process each diagnosis
-        for i, col in enumerate(diagnosis_cols, 1):
-            try:
-                diagnosis_val = str(row[col]).strip()
-                if pd.notna(diagnosis_val) and diagnosis_val != '' and diagnosis_val.lower() != 'nan':
-                    record = patient_data.copy()
-                    record.update({
-                        'diagnosis_number': i,
-                        'diagnosis': diagnosis_val,
-                    })
-                    records.append(record)
-            except Exception as e:
-                logger.warning(f"Error processing diagnosis column {col}: {str(e)}")
+    Returns:
+        The clinical domain as a string
+    """
+    if not text or not isinstance(text, str):
+        return "Unknown"
     
-    # Convert to DataFrame and ensure unique index
-    if records:
-        result_df = pd.DataFrame(records)
-        # Reset index to ensure uniqueness
-        result_df = result_df.reset_index(drop=True)
-        
-        # Ensure all necessary columns exist
-        for col in ['patient_id', 'gender', 'age', 'diagnosis']:
-            if col not in result_df.columns:
-                result_df[col] = "Unknown"
-        
-        return result_df
-    else:
-        logger.warning("No valid diagnoses found in data")
-        return pd.DataFrame()
+    text = text.lower()
+    
+    # Cardiometabolic keywords
+    cardio_keywords = [
+        'heart', 'cardiac', 'hypertension', 'diabetes', 'obesity', 'cholesterol', 
+        'lipid', 'blood pressure', 'stroke', 'vascular', 'coronary', 'cardiovascular',
+        'myocardial', 'infarction', 'atherosclerosis', 'artery', 'metabolic'
+    ]
+    
+    # Immune-Inflammation keywords
+    immune_keywords = [
+        'arthritis', 'inflammation', 'immune', 'lupus', 'rheumatoid', 'asthma',
+        'copd', 'pulmonary', 'respiratory', 'infection', 'pneumonia', 'crohn',
+        'colitis', 'psoriasis', 'allergy', 'allergic', 'ankylosing', 'spondylitis'
+    ]
+    
+    # Oncological keywords
+    cancer_keywords = [
+        'cancer', 'tumor', 'neoplasm', 'malignant', 'carcinoma', 'sarcoma',
+        'leukemia', 'lymphoma', 'metastasis', 'metastatic', 'oncology'
+    ]
+    
+    # Neuro-Mental Health keywords
+    mental_keywords = [
+        'depression', 'anxiety', 'psychiatric', 'bipolar', 'schizophrenia',
+        'mental', 'psychological', 'behavior', 'mood', 'substance', 'alcohol',
+        'drug', 'addiction', 'dementia', 'alzheimer', 'cognitive', 'migraine'
+    ]
+    
+    # Neurological & Frailty keywords
+    neuro_keywords = [
+        'brain', 'nerve', 'seizure', 'neuropathy', 'parkinson', 'alzheimer',
+        'multiple sclerosis', 'tremor', 'paralysis', 'weakness', 'frailty',
+        'fall', 'mobility', 'gait', 'balance', 'osteoporosis', 'fracture'
+    ]
+    
+    # SDOH keywords
+    sdoh_keywords = [
+        'housing', 'homeless', 'unemployment', 'education', 'literacy', 'food',
+        'insecurity', 'social', 'isolation', 'economic', 'poverty', 'income',
+        'transportation', 'access'
+    ]
+    
+    # Check for keyword matches
+    for keywords, domain in [
+        (cardio_keywords, "Cardiometabolic"),
+        (immune_keywords, "Immune-Inflammation"),
+        (cancer_keywords, "Oncological"),
+        (mental_keywords, "Neuro-Mental Health"),
+        (neuro_keywords, "Neurological-Frailty"),
+        (sdoh_keywords, "SDOH")
+    ]:
+        if any(keyword in text for keyword in keywords):
+            return domain
+    
+    return "Other"
 
 def analyze_comorbidity_data(icd_df, valid_icd_codes=None):
     """
@@ -915,66 +1016,183 @@ def process_domain_data(df: pd.DataFrame, diag_cols: list) -> pd.DataFrame:
 
 def assign_clinical_domain(icd_code: str) -> str:
     """
-    Assign a clinical domain based on ICD code or description.
-    Maps each ICD-10 code to one of the five functional domains:
-    - Cardiometabolic
-    - Immune-Inflammation
-    - Oncological (Cancer)
-    - Neuro-Mental Health
-    - Neurological & Frailty
+    Assigns a clinical domain to an ICD-10 code. This is a critical function that determines
+    how conditions are categorized into the five functional domains.
+    
+    Args:
+        icd_code: The ICD-10 code to categorize
+        
+    Returns:
+        The clinical domain as a string
     """
-    # Convert to lowercase for case-insensitive matching
-    code_lower = str(icd_code).lower()
+    if not icd_code or not isinstance(icd_code, str):
+        return "Unknown"
     
-    # Define domain mapping with keywords and ICD code prefixes
-    domains = {
-        'cardiometabolic': [
-            # Keywords
-            'heart', 'cardiac', 'hypertension', 'diabetes', 'obesity', 'cholesterol', 'lipid', 
-            'atherosclerosis', 'coronary', 'stroke', 'vascular', 'metabolic', 'dyslipidemia',
-            # ICD-10 code prefixes
-            'i0', 'i1', 'i2', 'i3', 'i4', 'i5', 'i6', 'i7', 'e08', 'e09', 'e10', 'e11', 'e13',
-            'e66', 'e78'
-        ],
-        'immune_inflammation': [
-            # Keywords
-            'arthritis', 'immune', 'inflammation', 'asthma', 'allergy', 'lupus', 'rheumatoid',
-            'infection', 'infectious', 'bacterial', 'viral', 'autoimmune', 'inflammatory',
-            # ICD-10 code prefixes
-            'a', 'b', 'j', 'l', 'm05', 'm06', 'm08', 'm30', 'm31', 'm32', 'm33', 'm34', 'm35', 'm36'
-        ],
-        'oncologic': [
-            # Keywords
-            'cancer', 'tumor', 'neoplasm', 'malignant', 'carcinoma', 'sarcoma', 'leukemia', 
-            'lymphoma', 'metastatic', 'oncology',
-            # ICD-10 code prefixes
-            'c', 'd0', 'd1', 'd2', 'd3', 'd4'
-        ],
-        'neuro_mental_health': [
-            # Keywords
-            'depression', 'anxiety', 'psychiatric', 'bipolar', 'schizophrenia', 'mental',
-            'psychological', 'behavior', 'mood', 'substance', 'alcohol', 'drug', 'dementia',
-            # ICD-10 code prefixes
-            'f'
-        ],
-        'neurological_frailty': [
-            # Keywords
-            'brain', 'nerve', 'seizure', 'neuropathy', 'parkinson', 'alzheimer', 'multiple sclerosis',
-            'tremor', 'paralysis', 'weakness', 'frailty', 'fall', 'mobility', 'gait', 'balance',
-            # ICD-10 code prefixes
-            'g', 'r26', 'r27', 'r29', 'r41', 'r42', 'r47', 'r54', 'r55', 'r56'
-        ]
-    }
+    # Normalize the ICD code to handle format variations
+    icd_cleaned = icd_code.strip().upper().replace('.', '')
     
-    # First check if the code starts with any of the ICD-10 prefixes
-    for domain, keywords in domains.items():
-        for keyword in keywords:
-            if (keyword.isalnum() and len(keyword) <= 3 and code_lower.startswith(keyword)) or \
-               (len(keyword) > 3 and keyword in code_lower):
-                return domain
-                
-    # If no match found, return 'other'
-    return 'other'
+    # Check if it's just the first 3 characters (category) or full code
+    icd_category = icd_cleaned[:3] if len(icd_cleaned) >= 3 else icd_cleaned
+    
+    # 1. CARDIOMETABOLIC DOMAIN
+    if (
+        # Hypertension and hypertensive diseases
+        (icd_category in ['I10', 'I11', 'I12', 'I13', 'I14', 'I15', 'I16']) or
+        # Diabetes mellitus
+        (icd_category in ['E08', 'E09', 'E10', 'E11', 'E12', 'E13']) or 
+        # Obesity
+        (icd_category == 'E66') or
+        # Hyperlipidemia and dyslipidemia
+        (icd_category == 'E78') or
+        # Ischemic heart diseases (CAD, angina, MI)
+        ('I20' <= icd_category <= 'I25') or
+        # Heart failure
+        (icd_category == 'I50') or
+        # Atrial fibrillation/flutter
+        (icd_category == 'I48') or
+        # Chronic kidney disease
+        (icd_category == 'N18') or
+        # Nonalcoholic fatty liver disease
+        (icd_cleaned.startswith('K760')) or
+        # Diabetic nephropathy
+        (icd_cleaned.startswith('E112')) or
+        # Cerebrovascular diseases (Stroke, TIA)
+        ('I60' <= icd_category <= 'I69') or
+        # Peripheral vascular diseases
+        ('I70' <= icd_category <= 'I79') or
+        # Chronic periodontal disease
+        (icd_category == 'K05') or
+        # Additional cardiometabolic conditions
+        (icd_category == 'E03') or  # Hypothyroidism
+        (icd_cleaned.startswith('E162')) or  # Hypoglycemia
+        (icd_cleaned.startswith('R030'))  # Elevated blood pressure
+    ):
+        return "Cardiometabolic"
+    
+    # 2. IMMUNE-INFLAMMATION DOMAIN
+    elif (
+        # Rheumatoid arthritis
+        (icd_category in ['M05', 'M06']) or
+        # Systemic lupus erythematosus (SLE)
+        (icd_category == 'M32') or
+        # Crohn's disease, Ulcerative colitis (IBD)
+        (icd_category in ['K50', 'K51']) or
+        # Psoriasis
+        (icd_category == 'L40') or
+        # Ankylosing spondylitis
+        (icd_category == 'M45') or
+        # Asthma
+        (icd_category == 'J45') or
+        # COPD
+        (icd_category == 'J44') or
+        # Sepsis
+        (icd_category in ['A40', 'A41']) or
+        # Multiple sclerosis
+        (icd_category == 'G35') or
+        # Periodontitis
+        (icd_category == 'K05') or
+        # Lupus erythematosus (cutaneous)
+        (icd_category == 'L93') or
+        # Systemic sclerosis (scleroderma)
+        (icd_category == 'L94') or
+        # GERD
+        (icd_category == 'K21')
+    ):
+        return "Immune-Inflammation"
+    
+    # 3. ONCOLOGICAL (CANCER) DOMAIN
+    elif (
+        # All malignant neoplasms
+        ('C00' <= icd_category <= 'D49') or
+        # Carcinoma in situ
+        ('D00' <= icd_category <= 'D09') or
+        # Personal or family history of cancer
+        (icd_category in ['Z80', 'Z85']) or
+        # Screening for malignant neoplasms
+        (icd_category == 'Z12') or
+        # Neoplasms of uncertain behavior
+        ('D37' <= icd_category <= 'D48') or
+        # Cancer-related pain
+        (icd_cleaned.startswith('G893'))
+    ):
+        return "Oncological"
+    
+    # 4. NEURO-MENTAL HEALTH DOMAIN
+    elif (
+        # Schizophrenia & psychotic disorders
+        ('F20' <= icd_category <= 'F29') or
+        # Mood disorders (depression, bipolar)
+        ('F30' <= icd_category <= 'F39') or
+        # Anxiety disorders
+        ('F40' <= icd_category <= 'F48') or
+        # Substance use disorders
+        ('F10' <= icd_category <= 'F19') or
+        # Dementia
+        ('F01' <= icd_category <= 'F03') or
+        # Eating disorders
+        (icd_category == 'F50') or
+        # Alzheimer's disease (cognitive/mental aspects)
+        (icd_category == 'G30') or
+        # Migraines
+        (icd_category == 'G43') or
+        # Behavioral/emotional disturbances
+        (icd_category == 'R45') or
+        # Sleep disorders
+        (icd_category == 'G47')
+    ):
+        return "Neuro-Mental Health"
+    
+    # 5. NEUROLOGICAL & FRAILTY DOMAIN
+    elif (
+        # Parkinson's disease
+        (icd_category == 'G20') or
+        # Alzheimer's and other dementias (frailty aspect)
+        ('G30' <= icd_category <= 'G31') or
+        # Multiple sclerosis
+        (icd_category == 'G35') or
+        # Sequelae of stroke
+        (icd_category == 'I69') or
+        # Osteoporosis
+        (icd_category in ['M80', 'M81']) or
+        # Gait & mobility disorders, falls
+        ('R26' <= icd_category <= 'R29') or
+        # Muscle wasting & sarcopenia
+        (icd_cleaned.startswith('M625')) or
+        # Paralytic syndromes
+        ('G81' <= icd_category <= 'G83') or
+        # Osteoarthritis
+        (icd_category == 'M19') or
+        # Cognitive symptoms
+        (icd_category == 'R41')
+    ):
+        return "Neurological-Frailty"
+    
+    # 6. SOCIAL DETERMINANTS OF HEALTH (SDOH)
+    elif (
+        # Education/literacy issues
+        (icd_category == 'Z55') or
+        # Employment/unemployment issues
+        (icd_category == 'Z56') or
+        # Housing instability, economic issues
+        (icd_category == 'Z59') or
+        # Social isolation, relationship issues
+        (icd_category == 'Z60') or
+        # Upbringing-related issues
+        (icd_category == 'Z62') or
+        # Family/social environment problems
+        (icd_category == 'Z63') or
+        # Legal/criminal issues affecting health
+        (icd_category == 'Z65') or
+        # Specific SDOH flags
+        (icd_cleaned.startswith('Z590')) or  # Homelessness
+        (icd_cleaned.startswith('Z594')) or  # Food insecurity
+        (icd_cleaned.startswith('Z598')) or  # Housing issues
+        (icd_cleaned.startswith('Z602'))     # Social isolation
+    ):
+        return "SDOH"
+    
+    # Default for unmatched codes
+    return "Other"
 
 def create_domain_network(domain_df: pd.DataFrame) -> nx.Graph:
     """Create a network of clinical domains and conditions."""
@@ -1810,84 +2028,187 @@ def calculate_hospitalization_risk(nhcrs_total: float) -> float:
     return probability
 
 def process_biomarker_data(df):
-    """Process biomarker data into a standardized format."""
+    """
+    Process biomarker data from various file formats.
+    
+    Args:
+        df: DataFrame containing biomarker data
+        
+    Returns:
+        DataFrame with standardized biomarker columns
+    """
     try:
-        if df is None or df.empty:
-            return pd.DataFrame()
-            
-        # Define common biomarker names and their variations
-        biomarker_mappings = {
-            'glucose': ['glucose', 'glu', 'blood sugar', 'fbs'],
-            'cholesterol': ['cholesterol', 'chol', 'tc'],
-            'hdl': ['hdl', 'hdl-c', 'good cholesterol'],
-            'ldl': ['ldl', 'ldl-c', 'bad cholesterol'],
-            'triglycerides': ['triglycerides', 'trig', 'tg'],
-            'blood_pressure_systolic': ['systolic', 'sbp', 'bp_systolic'],
-            'blood_pressure_diastolic': ['diastolic', 'dbp', 'bp_diastolic']
+        # Make a copy to avoid modifying the original
+        df_copy = df.copy()
+        
+        # Standardize column names (case insensitive)
+        df_copy.columns = [col.lower() for col in df_copy.columns]
+        
+        # Map common column variations to standard names
+        column_mappings = {
+            'pat id': 'patid', 
+            'patient id': 'patid',
+            'patientid': 'patid',
+            'sex': 'gender',
+            'age_years': 'age'
         }
         
+        # Apply column mappings where applicable
+        for old_col, new_col in column_mappings.items():
+            if old_col in df_copy.columns and new_col not in df_copy.columns:
+                df_copy.rename(columns={old_col: new_col}, inplace=True)
+        
+        # Function to find the best matching column for a target
         def find_best_column_match(target, possible_names):
             # First try exact matches
-            found_col = next((col for col in df.columns if col in possible_names), None)
-            if found_col:
-                return found_col
-                
-            # Then try case-insensitive matches
-            found_col = next((col for col in df.columns 
-                              if col.lower() in [name.lower() for name in possible_names]), None)
-            if found_col:
-                return found_col
-                
-            if FUZZY_AVAILABLE:
-                # Use fuzzy matching
-                best_match = None
-                best_score = 0
-                threshold = 80
-                
-                for col in df.columns:
-                    for name in possible_names:
-                        score = fuzz.ratio(col.lower(), name.lower())
-                        if score > best_score and score >= threshold:
-                            best_match = col
-                            best_score = score
-                            
-                if best_match:
-                    return best_match
-                    
+            if target in df_copy.columns:
+                return target
+            
+            # Then try partial matches
+            for col in df_copy.columns:
+                if any(name in col.lower() for name in possible_names):
+                    return col
+            
             return None
-            
-        # Find and rename columns
-        column_mapping = {}
-        for standard_name, variations in biomarker_mappings.items():
-            matched_col = find_best_column_match(standard_name, variations)
-            if matched_col:
-                column_mapping[matched_col] = standard_name
-                
-        if not column_mapping:
-            logger.warning("No biomarker columns found")
-            return pd.DataFrame()
-            
-        # Create new DataFrame with standardized column names
-        result_df = df.copy()
-        result_df = result_df.rename(columns=column_mapping)
         
-        # Convert values to float where possible
-        for col in column_mapping.values():
+        # Create patient_id column if it doesn't exist
+        if 'patient_id' not in df_copy.columns:
+            if 'patid' in df_copy.columns:
+                df_copy['patient_id'] = df_copy['patid'].astype(str)
+            else:
+                st.error("No patient identifier column found")
+                return pd.DataFrame()
+        
+        # Identify potential biomarker columns
+        exclude_cols = ['patient_id', 'patid', 'gender', 'age', 'zip_code']
+        biomarker_cols = [col for col in df_copy.columns if col not in exclude_cols]
+        
+        # Map recognized biomarker names to standardized names
+        biomarker_mappings = {
+            # Lipid panel
+            'ldl': 'ldl_cholesterol',
+            'ldl cholesterol': 'ldl_cholesterol',
+            'ldl-c': 'ldl_cholesterol',
+            'hdl': 'hdl_cholesterol',
+            'hdl cholesterol': 'hdl_cholesterol',
+            'hdl-c': 'hdl_cholesterol',
+            'total cholesterol': 'total_cholesterol',
+            'cholesterol': 'total_cholesterol',
+            'triglycerides': 'triglycerides',
+            'tg': 'triglycerides',
+            
+            # Diabetes markers
+            'glucose': 'glucose',
+            'fasting glucose': 'fasting_glucose',
+            'a1c': 'hba1c',
+            'hba1c': 'hba1c',
+            'hemoglobin a1c': 'hba1c',
+            
+            # Inflammation markers
+            'crp': 'crp',
+            'c-reactive protein': 'crp',
+            'hs-crp': 'hs_crp',
+            'high-sensitivity crp': 'hs_crp',
+            'esr': 'esr',
+            'erythrocyte sedimentation rate': 'esr',
+            
+            # Cardiac markers
+            'troponin': 'troponin',
+            'bnp': 'bnp',
+            'nt-probnp': 'nt_probnp',
+            'brain natriuretic peptide': 'bnp',
+            
+            # Kidney function
+            'creatinine': 'creatinine',
+            'egfr': 'egfr',
+            'estimated gfr': 'egfr',
+            'bun': 'bun',
+            'blood urea nitrogen': 'bun',
+            'albumin': 'albumin',
+            'microalbumin': 'microalbumin',
+            
+            # Liver function
+            'alt': 'alt',
+            'alanine aminotransferase': 'alt',
+            'ast': 'ast',
+            'aspartate aminotransferase': 'ast',
+            'alp': 'alp',
+            'alkaline phosphatase': 'alp',
+            'ggt': 'ggt',
+            'gamma-glutamyl transferase': 'ggt',
+            'bilirubin': 'bilirubin',
+            
+            # Blood count
+            'wbc': 'wbc',
+            'white blood cells': 'wbc',
+            'rbc': 'rbc',
+            'red blood cells': 'rbc',
+            'hemoglobin': 'hemoglobin',
+            'hb': 'hemoglobin',
+            'hematocrit': 'hematocrit',
+            'hct': 'hematocrit',
+            'platelets': 'platelets',
+            'plt': 'platelets',
+            
+            # Vitamins and minerals
+            'vitamin d': 'vitamin_d',
+            '25-oh vitamin d': 'vitamin_d',
+            'vitamin b12': 'vitamin_b12',
+            'folate': 'folate',
+            'iron': 'iron',
+            'ferritin': 'ferritin',
+            
+            # Thyroid function
+            'tsh': 'tsh',
+            'thyroid stimulating hormone': 'tsh',
+            'ft4': 'free_t4',
+            'free t4': 'free_t4',
+            'ft3': 'free_t3',
+            'free t3': 'free_t3'
+        }
+        
+        # Standardize biomarker column names
+        renamed_cols = {}
+        for col in biomarker_cols:
+            col_clean = col.strip().lower().replace(' ', '_')
+            if col_clean in biomarker_mappings:
+                renamed_cols[col] = biomarker_mappings[col_clean]
+            elif col.lower() in biomarker_mappings:
+                renamed_cols[col] = biomarker_mappings[col.lower()]
+        
+        # Apply the standardized names
+        if renamed_cols:
+            df_copy.rename(columns=renamed_cols, inplace=True)
+        
+        # Convert all biomarker values to numeric
+        biomarker_cols = [col for col in df_copy.columns if col not in exclude_cols]
+        for col in biomarker_cols:
             try:
-                result_df[col] = pd.to_numeric(result_df[col], errors='coerce')
+                df_copy[col] = pd.to_numeric(df_copy[col], errors='coerce')
             except:
-                logger.warning(f"Could not convert {col} to numeric values")
-                
-        return result_df
+                logger.warning(f"Could not convert column {col} to numeric")
         
+        return df_copy
+    
     except Exception as e:
+        st.error(f"Error processing biomarker data: {str(e)}")
         logger.error(f"Error in process_biomarker_data: {str(e)}")
         return pd.DataFrame()
 
 def perform_integrated_analysis(icd_df, biomarker_df=None):
     """
     Unified analysis framework that integrates network analysis and risk score calculations.
-    This optimized function combines both analyses to improve performance.
+    This optimized function combines both analyses to improve performance, following
+    the explicit workflow:
+    
+    1. Load & preprocess patient data (Excel/EHR FHIR)
+    2. Map ICD codes to domains explicitly
+    3. Calculate domain scores with gender/age adjustments
+    4. Calculate NHCRS total score
+    5. Calculate dynamic probabilities (hospitalization/mortality risk)
+    6. Perform network clustering
+    7. Generate clinical recommendations (if OpenAI API key available)
+    8. Generate structured PDF reports
     
     Args:
         icd_df: DataFrame containing ICD diagnosis data
@@ -1901,75 +2222,101 @@ def perform_integrated_analysis(icd_df, biomarker_df=None):
         st.info("Starting integrated analysis...")
         progress_bar = st.progress(0)
         
-        # Process the data into long format if needed
-        if 'diagnosis' not in icd_df.columns:
-            icd_df = process_diagnosis_data(icd_df)
-            if icd_df.empty:
-                logger.warning("No valid diagnosis data to analyze")
-                return None
+        # 1. PREPROCESS DATA
+        # -------------------
+        # Validate input data
+        if icd_df is None and biomarker_df is None:
+            st.error("No valid data provided for analysis")
+            return None
         
-        progress_bar.progress(10)
+        # Process the diagnosis data if available
+        domain_df = None
+        if icd_df is not None and not icd_df.empty:
+            # Process into domains if not already done
+            if 'domain' not in icd_df.columns:
+                # Get diagnosis columns
+                diag_cols = [col for col in icd_df.columns if 'diagnosis' in col.lower() or 'condition' in col.lower()]
+                # Map ICD codes to domains explicitly
+                domain_df = process_domain_data(icd_df, diag_cols)
+            else:
+                domain_df = icd_df.copy()
+            
+            progress_bar.progress(15)
         
-        # Get diagnosis columns
-        diag_cols = [col for col in icd_df.columns if 'diagnosis' in col.lower()]
-        
-        # Process data into domains - this is needed for both analysis types
-        domain_df = process_domain_data(icd_df, diag_cols)
-        progress_bar.progress(20)
-        
-        # Create network for centrality analysis
-        G = create_domain_network(domain_df)
-        progress_bar.progress(30)
-        
-        # Calculate network metrics (used in both analyses)
-        network_metrics = {}
+        # 2. NETWORK ANALYSIS
+        # ------------------
+        # Network initialization
+        G = None
         degree_cent = {}
         betweenness_cent = {}
+        communities = {0: []}
+        network_metrics = {}
+        node_centrality = {}
         
-        if G.number_of_nodes() > 0:
-            # Calculate centrality metrics
-            degree_cent = nx.degree_centrality(G)
-            betweenness_cent = nx.betweenness_centrality(G)
+        if domain_df is not None and not domain_df.empty:
+            # Create network for centrality analysis
+            G = create_domain_network(domain_df)
+            progress_bar.progress(25)
             
-            # Store network-level metrics
-            network_metrics = {
-                'node_count': G.number_of_nodes(),
-                'edge_count': G.number_of_edges(),
-                'density': nx.density(G),
-                'avg_clustering': nx.average_clustering(G) if G.number_of_nodes() > 2 else 0
-            }
-            
-            # Community detection using Louvain method
-            try:
-                if COMMUNITY_DETECTION_AVAILABLE:
-                    partition = community_louvain.best_partition(G)
-                    communities = defaultdict(list)
-                    for node, community_id in partition.items():
-                        communities[community_id].append(node)
-                    network_metrics['communities'] = len(communities)
-                    network_metrics['modularity'] = community_louvain.modularity(partition, G)
-                else:
+            # Calculate network metrics
+            if G.number_of_nodes() > 0:
+                # Calculate centrality metrics
+                degree_cent = nx.degree_centrality(G)
+                betweenness_cent = nx.betweenness_centrality(G)
+                
+                # Store network-level metrics
+                network_metrics = {
+                    'node_count': G.number_of_nodes(),
+                    'edge_count': G.number_of_edges(),
+                    'density': nx.density(G),
+                    'avg_clustering': nx.average_clustering(G) if G.number_of_nodes() > 2 else 0
+                }
+                
+                # 6. Network clustering explicitly (Louvain method)
+                # ------------------------------------------------
+                try:
+                    if COMMUNITY_DETECTION_AVAILABLE:
+                        partition = community_louvain.best_partition(G)
+                        communities = defaultdict(list)
+                        for node, community_id in partition.items():
+                            communities[community_id].append(node)
+                        network_metrics['communities'] = len(communities)
+                        network_metrics['modularity'] = community_louvain.modularity(partition, G)
+                    else:
+                        communities = {0: list(G.nodes())}
+                        network_metrics['communities'] = 1
+                        network_metrics['modularity'] = 0
+                        st.warning("Community detection library not available. Install python-louvain for better analysis.")
+                except Exception as e:
+                    logger.error(f"Error in community detection: {str(e)}")
                     communities = {0: list(G.nodes())}
                     network_metrics['communities'] = 1
                     network_metrics['modularity'] = 0
-            except:
-                communities = {0: list(G.nodes())}
-                network_metrics['communities'] = 1
-                network_metrics['modularity'] = 0
+                
+                # Create node metrics dictionary for easy access
+                for node in G.nodes():
+                    node_centrality[node] = {
+                        'degree_centrality': degree_cent.get(node, 0),
+                        'betweenness_centrality': betweenness_cent.get(node, 0),
+                        'domain': assign_clinical_domain(node)
+                    }
+            
+            progress_bar.progress(40)
         
-        progress_bar.progress(50)
+        # 3. RISK SCORE CALCULATION
+        # ------------------------
+        # Get patient IDs from available data
+        patient_ids = []
+        if domain_df is not None and not domain_df.empty:
+            patient_ids.extend(domain_df['patient_id'].unique())
+        if biomarker_df is not None and not biomarker_df.empty:
+            patient_ids.extend(biomarker_df['patient_id'].unique())
         
-        # Create a dictionary to store all node metrics for easy access
-        node_centrality = {}
-        for node in G.nodes():
-            node_centrality[node] = {
-                'degree_centrality': degree_cent.get(node, 0),
-                'betweenness_centrality': betweenness_cent.get(node, 0),
-                'domain': assign_clinical_domain(node)
-            }
-        
-        # Calculate patient-level metrics and risk scores (with or without biomarkers)
-        patient_ids = domain_df['patient_id'].unique()
+        # Remove duplicates and ensure we have patients to analyze
+        patient_ids = list(set(patient_ids))
+        if not patient_ids:
+            st.error("No valid patient IDs found in the data")
+            return None
         
         # Prepare results containers
         patient_results = {}
@@ -1978,31 +2325,30 @@ def perform_integrated_analysis(icd_df, biomarker_df=None):
         mortality_risks = {}
         hospitalization_risks = {}
         
-        # Prepare biomarker data if available
-        if biomarker_df is not None and not biomarker_df.empty:
-            # Filter to common patient IDs
-            common_ids = set(patient_ids) & set(biomarker_df['patient_id'].unique())
-            if common_ids:
-                patient_ids = list(common_ids)
-        
         # Track progress for patient calculations
         total_patients = len(patient_ids)
+        current_progress = 40
         
         # Process each patient
         for i, patient_id in enumerate(patient_ids):
-            # Update progress bar - gradually move from 50% to 90%
-            progress_value = 50 + int(40 * (i / total_patients))
+            # Update progress bar
+            progress_value = current_progress + int(50 * (i / total_patients))
             progress_bar.progress(progress_value)
             
-            # Get patient conditions
-            patient_conditions = domain_df[domain_df['patient_id'] == patient_id]['condition'].tolist()
+            # Get patient conditions if ICD data available
+            patient_conditions = []
+            patient_demographics = {'age': 0, 'gender': 'Unknown'}
             
-            # Get patient demographics
-            patient_rows = domain_df[domain_df['patient_id'] == patient_id]
-            if patient_rows.empty:
-                continue
-                
-            patient_data_row = patient_rows.iloc[0]
+            if domain_df is not None and not domain_df.empty:
+                patient_rows = domain_df[domain_df['patient_id'] == patient_id]
+                if not patient_rows.empty:
+                    patient_conditions = patient_rows['condition'].tolist()
+                    # Get demographics from the first row
+                    first_row = patient_rows.iloc[0]
+                    patient_demographics = {
+                        'age': first_row.get('age', 0),
+                        'gender': first_row.get('gender', 'Unknown')
+                    }
             
             # Extract biomarker values if available
             biomarkers = {}
@@ -2023,7 +2369,7 @@ def perform_integrated_analysis(icd_df, biomarker_df=None):
                 'betweenness_centrality': 0
             }
             
-            if G.number_of_nodes() > 0:
+            if G is not None and G.number_of_nodes() > 0:
                 # Average the centrality of all patient conditions
                 valid_conditions = [c for c in patient_conditions if c in G.nodes()]
                 if valid_conditions:
@@ -2034,28 +2380,47 @@ def perform_integrated_analysis(icd_df, biomarker_df=None):
                         betweenness_cent.get(c, 0) for c in valid_conditions
                     ])
             
+            # 2. Map ICD codes to domains explicitly
+            # -------------------------------------
+            # Count conditions by domain for this patient
+            domain_condition_counts = {}
+            if patient_conditions:
+                # Group conditions by domain
+                for condition in patient_conditions:
+                    domain = assign_clinical_domain(condition)
+                    if domain not in domain_condition_counts:
+                        domain_condition_counts[domain] = 0
+                    domain_condition_counts[domain] += 1
+            
             # Prepare patient data for risk calculation
             patient_info = {
                 'patient_id': patient_id,
                 'conditions': patient_conditions,
-                'age': patient_data_row.get('age', 0),
-                'gender': patient_data_row.get('gender', 'Unknown'),
+                'age': patient_demographics.get('age', 0),
+                'gender': patient_demographics.get('gender', 'Unknown'),
                 'network_metrics': network_metrics_patient,
                 'biomarkers': biomarkers,
-                'sdoh_data': {}  # Placeholder for SDOH data
+                'sdoh_data': {},  # Placeholder for SDOH data
+                'domain_condition_counts': domain_condition_counts
             }
             
-            # Calculate risk scores using the enhanced NHCRS model
+            # 3 & 4. Calculate domain scores and NHCRS total with gender/age adjustments
+            # -------------------------------------------------------------------------
             risk_result = calculate_total_risk_score(patient_info)
             
             # Store results
             patient_results[patient_id] = patient_info
             risk_scores[patient_id] = risk_result.get('total_score', 0)
             domain_scores[patient_id] = risk_result.get('domain_scores', {})
+            
+            # 5. Calculate dynamic probabilities (hospitalization/mortality risk)
+            # -----------------------------------------------------------------
             mortality_risks[patient_id] = risk_result.get('mortality_risk_10yr', 0)
             hospitalization_risks[patient_id] = risk_result.get('hospitalization_risk_5yr', 0)
         
-        # Calculate domain distribution
+        progress_bar.progress(90)
+        
+        # Calculate domain distribution across all patients
         all_domains = []
         for patient_id in domain_scores:
             all_domains.extend(domain_scores[patient_id].keys())
@@ -2102,7 +2467,7 @@ def perform_integrated_analysis(icd_df, biomarker_df=None):
             'mortality_risks': mortality_risks,
             'hospitalization_risks': hospitalization_risks,
             'domain_counts': domain_counts,
-            'communities': communities if 'communities' in locals() else {0: list(G.nodes())},
+            'communities': communities if 'communities' in locals() else {0: list(G.nodes()) if G else []},
             'node_centrality': node_centrality
         }
             
@@ -2172,112 +2537,116 @@ def main():
     
     # Local file upload
     if auth_type == "Local Upload":
-        # Data source selection
-        data_source = st.radio(
-            "Select Data Source:",
-            ["Separate Files (ICD-10 & Biomarkers)", "Combined Excel File"],
-            key="main_data_source_selection"
-        )
-        
-        # UI for file uploads
+        # Create two columns for file uploads
         col1, col2 = st.columns(2)
         
         with col1:
-            # ICD-10 data upload
-            st.subheader("Upload ICD-10 Data")
+            st.subheader("Upload Comorbidity Data")
             icd_file = st.file_uploader("Upload ICD-10 Excel file", 
-                                         type=["xlsx", "xls"], 
-                                         key="main_icd_upload",
-                                         help="Excel file with columns: PatId, Gender, Age, and Diagnosis columns")
+                                      type=["xlsx", "xls"],
+                                      key="icd_upload",
+                                      help="Excel file with columns: PatId, Gender, Age, and Diagnosis columns")
         
         with col2:
-            # Biomarker data upload
             st.subheader("Upload Biomarker Data")
             bio_file = st.file_uploader("Upload Biomarker Excel file",
-                                         type=["xlsx", "xls"],
-                                         key="main_bio_upload",
-                                         help="Excel file with biomarker measurements")
+                                      type=["xlsx", "xls"],
+                                      key="bio_upload",
+                                      help="Excel file with biomarker measurements")
         
-        # Process the data after upload
+        # Process the uploaded files
+        icd_df = None
+        bio_df = None
+        
+        # Process ICD-10 data if present
         if icd_file is not None:
             try:
-                st.subheader("ICD-10 Data Processing")
-                # Read the Excel file into a DataFrame
-                icd_df = pd.read_excel(icd_file)
+                df = pd.read_excel(icd_file)
                 
                 # Fix column names - support PatId and Pat Id variations
-                if 'Pat Id' in icd_df.columns and 'PatId' not in icd_df.columns:
-                    icd_df.rename(columns={'Pat Id': 'PatId'}, inplace=True)
+                if 'Pat Id' in df.columns and 'PatId' not in df.columns:
+                    df.rename(columns={'Pat Id': 'PatId'}, inplace=True)
                 
-                # Process the DataFrame
-                icd_df = process_diagnosis_data(icd_df)
-                
+                icd_df = process_diagnosis_data(df)
                 if icd_df is not None and not icd_df.empty:
                     st.success(f"Successfully processed {len(icd_df)} ICD-10 records for {len(icd_df['patient_id'].unique())} patients.")
                     
-                    # Prepare a summary
-                    icd_summary = {
-                        "Total Patients": len(icd_df['patient_id'].unique()),
-                        "Total Diagnoses": len(icd_df),
-                        "Domains Found": icd_df['domain'].unique().tolist() if 'domain' in icd_df.columns else []
-                    }
-                    
-                    # Display data summary
+                    # Show ICD data summary
                     with st.expander("View ICD-10 Data Summary"):
-                        st.write(icd_summary)
+                        st.write({
+                            "Total Patients": len(icd_df['patient_id'].unique()),
+                            "Total Diagnoses": len(icd_df),
+                            "Domains Found": icd_df['domain'].unique().tolist() if 'domain' in icd_df.columns else []
+                        })
+            except Exception as e:
+                st.error(f"Error processing ICD-10 data: {str(e)}")
+        
+        # Process biomarker data if present
+        if bio_file is not None:
+            try:
+                df = pd.read_excel(bio_file)
+                
+                # Fix column names - support PatId and Pat Id variations
+                if 'Pat Id' in df.columns and 'PatId' not in df.columns:
+                    df.rename(columns={'Pat Id': 'PatId'}, inplace=True)
+                
+                bio_df = process_biomarker_data(df)
+                if bio_df is not None and not bio_df.empty:
+                    st.success(f"Successfully processed biomarker data for {bio_df['patient_id'].nunique()} patients.")
                     
-                    # Process biomarker data if available
-                    bio_df = None
-                    if bio_file is not None:
-                        try:
-                            # Read the biomarker file into a DataFrame
-                            bio_df = pd.read_excel(bio_file)
+                    # Show biomarker data summary
+                    with st.expander("View Biomarker Data Summary"):
+                        st.write({
+                            "Total Patients": bio_df['patient_id'].nunique(),
+                            "Biomarkers Available": [col for col in bio_df.columns if col != 'patient_id']
+                        })
+            except Exception as e:
+                st.error(f"Error processing biomarker data: {str(e)}")
+        
+        # Perform analysis based on available data
+        if icd_df is not None or bio_df is not None:
+            with st.spinner("Performing analysis... This may take a moment."):
+                if icd_df is not None and bio_df is not None:
+                    st.info("Performing combined analysis with both comorbidity and biomarker data...")
+                    analysis_results = perform_integrated_analysis(icd_df, bio_df)
+                elif icd_df is not None:
+                    st.info("Performing comorbidity analysis...")
+                    analysis_results = perform_integrated_analysis(icd_df, None)
+                else:
+                    st.info("Performing biomarker analysis...")
+                    analysis_results = perform_integrated_analysis(None, bio_df)
+                
+                if analysis_results:
+                    st.success("Analysis completed successfully!")
+                    
+                    # Get the view type from session state
+                    view_type = st.session_state.get('view_type', 'Population Analysis')
+                    
+                    # Use tabs for better organization of different analysis components
+                    tabs = st.tabs(["Overview", "Network Analysis", "Risk Analysis", "Domain Analysis"])
+                    
+                    with tabs[0]:  # Overview tab
+                        st.subheader("Analysis Overview")
+                        combined_df = analysis_results.get('combined_df')
+                        risk_scores = analysis_results.get('risk_scores')
+                        domain_counts = analysis_results.get('domain_counts')
+                        mortality_risks = analysis_results.get('mortality_risks')
+                        
+                        # Metrics overview
+                        col1, col2, col3, col4 = st.columns(4)
+                        with col1:
+                            st.metric("Total Patients", combined_df['patient_id'].nunique())
+                        with col2:
+                            high_risk = len([s for s in risk_scores.values() if s > 7])
+                            st.metric("High Risk Patients", high_risk)
+                        with col3:
+                            avg_score = sum(risk_scores.values()) / len(risk_scores) if risk_scores else 0
+                            st.metric("Average Risk Score", f"{avg_score:.2f}")
+                        with col4:
+                            # Calculate average mortality risk
+                            avg_mortality = sum(mortality_risks.values()) / len(mortality_risks) if mortality_risks else 0
+                            st.metric("Avg Mortality Risk", f"{avg_mortality:.1f}%")
                             
-                            # Fix column names - support PatId and Pat Id variations
-                            if 'Pat Id' in bio_df.columns and 'PatId' not in bio_df.columns:
-                                bio_df.rename(columns={'Pat Id': 'PatId'}, inplace=True)
-                                
-                            bio_df = process_biomarker_data(bio_df)
-                            if not bio_df.empty:
-                                st.success(f"Successfully processed biomarker data for {bio_df['patient_id'].nunique()} patients.")
-                        except Exception as e:
-                            st.error(f"Error processing biomarker data: {str(e)}")
-                    
-                    # Perform integrated analysis
-                    with st.spinner("Performing comprehensive analysis... This may take a moment."):
-                        analysis_results = perform_integrated_analysis(icd_df, bio_df)
-                    
-                    if analysis_results:
-                        st.success("Analysis completed successfully!")
-                        
-                        # Get the view type from session state
-                        view_type = st.session_state.get('view_type', 'Population Analysis')
-                        
-                        # Use tabs for better organization of different analysis components
-                        tabs = st.tabs(["Overview", "Network Analysis", "Risk Analysis", "Domain Analysis"])
-                        
-                        with tabs[0]:  # Overview tab
-                            st.subheader("Analysis Overview")
-                            combined_df = analysis_results.get('combined_df')
-                            risk_scores = analysis_results.get('risk_scores')
-                            domain_counts = analysis_results.get('domain_counts')
-                            mortality_risks = analysis_results.get('mortality_risks')
-                            
-                            # Metrics overview
-                            col1, col2, col3, col4 = st.columns(4)
-                            with col1:
-                                st.metric("Total Patients", combined_df['patient_id'].nunique())
-                            with col2:
-                                high_risk = len([s for s in risk_scores.values() if s > 7])
-                                st.metric("High Risk Patients", high_risk)
-                            with col3:
-                                avg_score = sum(risk_scores.values()) / len(risk_scores) if risk_scores else 0
-                                st.metric("Average Risk Score", f"{avg_score:.2f}")
-                            with col4:
-                                # Calculate average mortality risk
-                                avg_mortality = sum(mortality_risks.values()) / len(mortality_risks) if mortality_risks else 0
-                                st.metric("Avg Mortality Risk", f"{avg_mortality:.1f}%")
-                                
                         with tabs[1]:  # Network Analysis tab
                             st.subheader("Condition Network Analysis")
                             G = analysis_results.get('G')
@@ -2320,7 +2689,7 @@ def main():
                                                      color_continuous_scale='RdBu_r', 
                                                      zmin=-1, zmax=1)
                                         st.plotly_chart(fig, use_container_width=True)
-                                
+                            
                         with tabs[2]:  # Risk Analysis tab
                             st.subheader("Risk Score Analysis")
                             
@@ -2457,165 +2826,161 @@ def main():
                                             'Value': biomarkers.values()
                                         })
                                         st.dataframe(biomarker_df)
-                                
-                                with patient_tabs[1]:  # Risk Scores tab
-                                    st.subheader("Risk Assessment")
                                     
-                                    # Risk metrics
-                                    risk_cols = st.columns(3)
-                                    with risk_cols[0]:
-                                        st.metric("NHCRS Score", f"{patient_risk['total_score']:.1f}")
-                                    with risk_cols[1]:
-                                        st.metric("10-Year Mortality Risk", f"{patient_risk['mortality_risk_10yr']:.1f}%")
-                                    with risk_cols[2]:
-                                        st.metric("5-Year Hospitalization Risk", f"{patient_risk['hospitalization_risk_5yr']:.1f}%")
-                                    
-                                    # Domain scores visualization
-                                    if patient_risk['domain_scores']:
-                                        domain_scores_df = pd.DataFrame({
-                                            'Domain': list(patient_risk['domain_scores'].keys()),
-                                            'Score': list(patient_risk['domain_scores'].values())
-                                        })
+                                    with patient_tabs[1]:  # Risk Scores tab
+                                        st.subheader("Risk Assessment")
                                         
-                                        domain_fig = px.bar(domain_scores_df, x='Domain', y='Score',
-                                                          color='Score', color_continuous_scale='Reds',
-                                                          title="Patient Domain Risk Scores")
-                                        st.plotly_chart(domain_fig, use_container_width=True)
+                                        # Risk metrics
+                                        risk_cols = st.columns(3)
+                                        with risk_cols[0]:
+                                            st.metric("NHCRS Score", f"{patient_risk['total_score']:.1f}")
+                                        with risk_cols[1]:
+                                            st.metric("10-Year Mortality Risk", f"{patient_risk['mortality_risk_10yr']:.1f}%")
+                                        with risk_cols[2]:
+                                            st.metric("5-Year Hospitalization Risk", f"{patient_risk['hospitalization_risk_5yr']:.1f}%")
                                         
-                                        # Radar chart for domain visualization
-                                        domains = list(patient_risk['domain_scores'].keys())
-                                        scores = list(patient_risk['domain_scores'].values())
-                                        
-                                        # Close the loop for radar chart
-                                        domains.append(domains[0])
-                                        scores.append(scores[0])
-                                        
-                                        radar_fig = go.Figure()
-                                        radar_fig.add_trace(go.Scatterpolar(
-                                            r=scores,
-                                            theta=domains,
-                                            fill='toself',
-                                            name='Patient Domain Scores'
-                                        ))
-                                        
-                                        radar_fig.update_layout(
-                                            polar=dict(
-                                                radialaxis=dict(
-                                                    visible=True,
-                                                    range=[0, 10]
-                                                )
-                                            ),
-                                            title="Domain Risk Profile"
-                                        )
-                                        st.plotly_chart(radar_fig, use_container_width=True)
-                                
-                                with patient_tabs[2]:  # Population Comparison tab
-                                    st.subheader("Patient vs Population Comparison")
-                                    
-                                    # Risk score comparison
-                                    risk_scores = analysis_results.get('risk_scores', {})
-                                    mortality_risks = analysis_results.get('mortality_risks', {})
-                                    avg_score = sum(risk_scores.values()) / len(risk_scores) if risk_scores else 0
-                                    avg_mortality = sum(mortality_risks.values()) / len(mortality_risks) if mortality_risks else 0
-                                    
-                                    compare_cols = st.columns(3)
-                                    with compare_cols[0]:
-                                        patient_score = patient_risk['total_score']
-                                        delta = f"{patient_score - avg_score:.2f}"
-                                        st.metric("Risk Score", f"{patient_score:.2f}", delta=delta, 
-                                                delta_color="inverse")
-                                        
-                                    with compare_cols[1]:
-                                        patient_mortality = patient_risk['mortality_risk_10yr']
-                                        delta_m = f"{patient_mortality - avg_mortality:.1f}%"
-                                        st.metric("Mortality Risk", f"{patient_mortality:.1f}%", delta=delta_m,
-                                                delta_color="inverse")
-                                        
-                                    with compare_cols[2]:
-                                        # Domain count comparison
-                                        patient_domains = len(patient_risk['domain_scores'])
-                                        domain_scores = analysis_results.get('domain_scores', {})
-                                        avg_domains = sum(len(d) for d in domain_scores.values()) / len(patient_ids)
-                                        delta_d = f"{patient_domains - avg_domains:.1f}"
-                                        st.metric("Clinical Domains", patient_domains, delta=delta_d,
-                                                delta_color="inverse")
-                                    
-                                    # Domain comparison chart
-                                    if patient_risk['domain_scores']:
-                                        st.subheader("Domain Score Comparison")
-                                        # Get average domain scores across population
-                                        all_domain_scores = analysis_results.get('domain_scores', {})
-                                        avg_domain_scores = {}
-                                        for domain in patient_risk['domain_scores'].keys():
-                                            domain_values = [scores.get(domain, 0) for scores in all_domain_scores.values()]
-                                            avg_domain_scores[domain] = sum(domain_values) / len(domain_values) if domain_values else 0
-                                        
-                                        # Create comparison dataframe
-                                        compare_df = pd.DataFrame({
-                                            'Domain': list(patient_risk['domain_scores'].keys()),
-                                            'Patient Score': list(patient_risk['domain_scores'].values()),
-                                            'Population Average': [avg_domain_scores.get(d, 0) for d in patient_risk['domain_scores'].keys()]
-                                        })
-                                        
-                                        # Create comparison chart
-                                        domain_compare = px.bar(compare_df, x='Domain', y=['Patient Score', 'Population Average'], 
-                                                           barmode='group', title="Domain Score Comparison")
-                                        st.plotly_chart(domain_compare, use_container_width=True)
-                                    
-                                    # Percentile rank information
-                                    st.subheader("Patient Percentile Ranks")
-                                    
-                                    # Calculate percentile for this patient's risk score
-                                    all_scores = list(risk_scores.values())
-                                    all_scores.sort()
-                                    patient_score = patient_risk['total_score']
-                                    percentile = sum(1 for s in all_scores if s < patient_score) / len(all_scores) * 100
-                                    
-                                    st.write(f"This patient's risk score is higher than {percentile:.1f}% of the population.")
-                                    
-                                    # Visualize position in population
-                                    fig = px.histogram(all_scores, 
-                                                    title="Patient Position in Population Distribution",
-                                                    labels={'value': 'Risk Score', 'count': 'Number of Patients'})
-                                    fig.add_vline(x=patient_score, line_width=3, line_dash="dash", line_color="red")
-                                    fig.add_annotation(x=patient_score, y=0, 
-                                                    text=f"Patient: {patient_score:.1f}",
-                                                    showarrow=True, arrowhead=1)
-                                    st.plotly_chart(fig, use_container_width=True)
-                                
-                                # Generate AI recommendations if API key available
-                                if 'openai_api_key' in st.session_state:
-                                    if st.button("Generate AI Clinical Recommendations"):
-                                        with st.spinner("Generating AI recommendations..."):
-                                            recommendations = generate_clinical_recommendations(patient_data, patient_risk)
-                                            st.subheader("AI Clinical Recommendations")
-                                            st.write(recommendations)
+                                        # Domain scores visualization
+                                        if patient_risk['domain_scores']:
+                                            domain_scores_df = pd.DataFrame({
+                                                'Domain': list(patient_risk['domain_scores'].keys()),
+                                                'Score': list(patient_risk['domain_scores'].values())
+                                            })
                                             
-                                            # Store recommendations for PDF
-                                            st.session_state.recommendations = recommendations
-                                
-                                # PDF generation
-                                if st.button("Generate PDF Report"):
-                                    with st.spinner("Generating PDF report..."):
-                                        recommendations = st.session_state.get('recommendations', None)
-                                        pdf_bytes = generate_pdf_report(patient_data, patient_risk, recommendations)
+                                            domain_fig = px.bar(domain_scores_df, x='Domain', y='Score',
+                                                              color='Score', color_continuous_scale='Reds',
+                                                              title="Patient Domain Risk Scores")
+                                            st.plotly_chart(domain_fig, use_container_width=True)
+                                            
+                                            # Radar chart for domain visualization
+                                            domains = list(patient_risk['domain_scores'].keys())
+                                            scores = list(patient_risk['domain_scores'].values())
+                                            
+                                            # Close the loop for radar chart
+                                            domains.append(domains[0])
+                                            scores.append(scores[0])
+                                            
+                                            radar_fig = go.Figure()
+                                            radar_fig.add_trace(go.Scatterpolar(
+                                                r=scores,
+                                                theta=domains,
+                                                fill='toself',
+                                                name='Patient Domain Scores'
+                                            ))
+                                            
+                                            radar_fig.update_layout(
+                                                polar=dict(
+                                                    radialaxis=dict(
+                                                        visible=True,
+                                                        range=[0, 10]
+                                                    )
+                                                ),
+                                                title="Domain Risk Profile"
+                                            )
+                                            st.plotly_chart(radar_fig, use_container_width=True)
+                                    
+                                    with patient_tabs[2]:  # Population Comparison tab
+                                        st.subheader("Patient vs Population Comparison")
                                         
-                                        # Create download button
-                                        b64_pdf = base64.b64encode(pdf_bytes).decode()
-                                        href = f'<a href="data:application/pdf;base64,{b64_pdf}" download="patient_{selected_patient}_report.pdf">Download PDF Report</a>'
-                                        st.markdown(href, unsafe_allow_html=True)
+                                        # Risk score comparison
+                                        risk_scores = analysis_results.get('risk_scores', {})
+                                        mortality_risks = analysis_results.get('mortality_risks', {})
+                                        avg_score = sum(risk_scores.values()) / len(risk_scores) if risk_scores else 0
+                                        avg_mortality = sum(mortality_risks.values()) / len(mortality_risks) if mortality_risks else 0
                                         
-            except Exception as e:
-                st.error(f"Error processing data: {str(e)}")
-                st.error("Please ensure your file contains the required columns: PatId, Gender, Age, Zip Code, and at least one Diagnosis column (ICD10 code or description)")
-    
+                                        compare_cols = st.columns(3)
+                                        with compare_cols[0]:
+                                            patient_score = patient_risk['total_score']
+                                            delta = f"{patient_score - avg_score:.2f}"
+                                            st.metric("Risk Score", f"{patient_score:.2f}", delta=delta, 
+                                                    delta_color="inverse")
+                                            
+                                        with compare_cols[1]:
+                                            patient_mortality = patient_risk['mortality_risk_10yr']
+                                            delta_m = f"{patient_mortality - avg_mortality:.1f}%"
+                                            st.metric("Mortality Risk", f"{patient_mortality:.1f}%", delta=delta_m,
+                                                    delta_color="inverse")
+                                            
+                                        with compare_cols[2]:
+                                            # Domain count comparison
+                                            patient_domains = len(patient_risk['domain_scores'])
+                                            domain_scores = analysis_results.get('domain_scores', {})
+                                            avg_domains = sum(len(d) for d in domain_scores.values()) / len(patient_ids)
+                                            delta_d = f"{patient_domains - avg_domains:.1f}"
+                                            st.metric("Clinical Domains", patient_domains, delta=delta_d,
+                                                    delta_color="inverse")
+                                        
+                                        # Domain comparison chart
+                                        if patient_risk['domain_scores']:
+                                            st.subheader("Domain Score Comparison")
+                                            # Get average domain scores across population
+                                            all_domain_scores = analysis_results.get('domain_scores', {})
+                                            avg_domain_scores = {}
+                                            for domain in patient_risk['domain_scores'].keys():
+                                                domain_values = [scores.get(domain, 0) for scores in all_domain_scores.values()]
+                                                avg_domain_scores[domain] = sum(domain_values) / len(domain_values) if domain_values else 0
+                                            
+                                            # Create comparison dataframe
+                                            compare_df = pd.DataFrame({
+                                                'Domain': list(patient_risk['domain_scores'].keys()),
+                                                'Patient Score': list(patient_risk['domain_scores'].values()),
+                                                'Population Average': [avg_domain_scores.get(d, 0) for d in patient_risk['domain_scores'].keys()]
+                                            })
+                                            
+                                            # Create comparison chart
+                                            domain_compare = px.bar(compare_df, x='Domain', y=['Patient Score', 'Population Average'], 
+                                                               barmode='group', title="Domain Score Comparison")
+                                            st.plotly_chart(domain_compare, use_container_width=True)
+                                        
+                                        # Percentile rank information
+                                        st.subheader("Patient Percentile Ranks")
+                                        
+                                        # Calculate percentile for this patient's risk score
+                                        all_scores = list(risk_scores.values())
+                                        all_scores.sort()
+                                        patient_score = patient_risk['total_score']
+                                        percentile = sum(1 for s in all_scores if s < patient_score) / len(all_scores) * 100
+                                        
+                                        st.write(f"This patient's risk score is higher than {percentile:.1f}% of the population.")
+                                        
+                                        # Visualize position in population
+                                        fig = px.histogram(all_scores, 
+                                                        title="Patient Position in Population Distribution",
+                                                        labels={'value': 'Risk Score', 'count': 'Number of Patients'})
+                                        fig.add_vline(x=patient_score, line_width=3, line_dash="dash", line_color="red")
+                                        fig.add_annotation(x=patient_score, y=0, 
+                                                        text=f"Patient: {patient_score:.1f}",
+                                                        showarrow=True, arrowhead=1)
+                                        st.plotly_chart(fig, use_container_width=True)
+                                    
+                                    # Generate AI recommendations if API key available
+                                    if 'openai_api_key' in st.session_state:
+                                        if st.button("Generate AI Clinical Recommendations"):
+                                            with st.spinner("Generating AI recommendations..."):
+                                                recommendations = generate_clinical_recommendations(patient_data, patient_risk)
+                                                st.subheader("AI Clinical Recommendations")
+                                                st.write(recommendations)
+                                                
+                                                # Store recommendations for PDF
+                                                st.session_state.recommendations = recommendations
+                                    
+                                    # PDF generation
+                                    if st.button("Generate PDF Report"):
+                                        with st.spinner("Generating PDF report..."):
+                                            recommendations = st.session_state.get('recommendations', None)
+                                            pdf_bytes = generate_pdf_report(patient_data, patient_risk, recommendations)
+                                            
+                                            # Create download button
+                                            b64_pdf = base64.b64encode(pdf_bytes).decode()
+                                            href = f'<a href="data:application/pdf;base64,{b64_pdf}" download="patient_{selected_patient}_report.pdf">Download PDF Report</a>'
+                                            st.markdown(href, unsafe_allow_html=True)
+                            
     # FHIR Integration
     else:
         st.info("FHIR Integration is coming soon! Please use local file upload for now.")
     
     # Add footer
     st.sidebar.divider()
-    st.sidebar.markdown("© 2023 Nudge Health AI. All rights reserved.")
+    st.sidebar.markdown("© 2025 Nudge Health AI. All rights reserved.")
 
 # Helper function to extract patient data from DataFrame
 def get_patient_data(df, patient_id):
