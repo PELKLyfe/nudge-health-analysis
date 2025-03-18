@@ -24,24 +24,25 @@ import openai
 from fpdf import FPDF
 from datetime import datetime
 import time
-import community as community_louvain
 
-try:
-    from fuzzywuzzy import fuzz
-    FUZZY_AVAILABLE = True
-except ImportError:
-    FUZZY_AVAILABLE = False
+# Configure logging first
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
+# Now import community detection with logging available
 try:
+    import community as community_louvain
     COMMUNITY_DETECTION_AVAILABLE = True
     logger.info("Community detection module loaded successfully")
 except ImportError:
     COMMUNITY_DETECTION_AVAILABLE = False
     logger.warning("Community detection module not available. Install python-louvain for better analysis.")
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+try:
+    from fuzzywuzzy import fuzz
+    FUZZY_AVAILABLE = True
+except ImportError:
+    FUZZY_AVAILABLE = False
 
 # Configure Streamlit page
 st.set_page_config(page_title="Nudge Health AI Clinical Analyzer", layout="wide")
