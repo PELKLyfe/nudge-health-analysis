@@ -2133,6 +2133,15 @@ def main():
     if api_key:
         st.session_state.openai_api_key = api_key
         os.environ["OPENAI_API_KEY"] = api_key
+    else:
+        # Try to get API key from secrets
+        try:
+            api_key = st.secrets["OPENAI_API_KEY"]
+            if api_key and api_key != "your-api-key-here":
+                st.session_state.openai_api_key = api_key
+                os.environ["OPENAI_API_KEY"] = api_key
+        except Exception as e:
+            st.sidebar.info("No OpenAI API key found. AI recommendations will be disabled.")
     
     st.sidebar.divider()
     
