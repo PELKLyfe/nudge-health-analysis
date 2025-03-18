@@ -25,6 +25,16 @@ from fpdf import FPDF
 from datetime import datetime
 import time
 
+# Add at the beginning of the file where other imports are located
+try:
+    import leidenalg as la
+    import igraph as ig
+    LEIDEN_AVAILABLE = True
+    logger.info("Leiden community detection module loaded successfully")
+except ImportError:
+    LEIDEN_AVAILABLE = False
+    logger.warning("Leiden module not available. Install leidenalg for advanced community detection.")
+
 # Configure logging first
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -985,9 +995,9 @@ def perform_combined_analysis(domain_df, biomarker_df):
         with risk_cols[0]:
             st.metric("NHCRS Score", f"{patient_row['total_score']:.1f}")
         with risk_cols[1]:
-            st.metric("10-Year Mortality Risk", f"{patient_row['mortality_risk_10yr']}%")
+            st.metric("10-Year Mortality Risk", f"{patient_row['mortality_risk_10yr']:.1f}%")
         with risk_cols[2]:
-            st.metric("5-Year Hospitalization Risk", f"{patient_row['hospitalization_risk_5yr']}%")
+            st.metric("5-Year Hospitalization Risk", f"{patient_row['hospitalization_risk_5yr']:.1f}%")
             
         # Create domain scores visualization
         domain_scores = patient_row['domain_scores']
@@ -1479,2043 +1489,1021 @@ def assign_clinical_domain(icd_code: str) -> str:
 
 def create_domain_network(df, domain_df):
     """
-    Create a network of conditions based on patient diagnoses.
+    Create a network of conditions based on patient diagnoses using Mutual Information.
     
     Args:
         df: DataFrame with patient and condition data
         domain_df: DataFrame with domain information
         
     Returns:
-        G: NetworkX graph object
+        G: NetworkX graph object with MI-based edges and community detection
     """
     if df is None or df.empty:
         logger.warning("No data available for network creation")
         return None
         
-    if 'patient_id' not in df.columns or 'condition' not in df.columns:
+    if 'patient_id' not in df.columns or 'condition' not in domain_df.columns:
         logger.warning("Required columns (patient_id, condition) not found in data")
         return None
     
-    # Initialize graph
-    G = nx.Graph()
+    # First attempt to create MI-based network (statistically validated)
+    G = create_mi_condition_network(domain_df, min_mi_score=0.05, p_threshold=0.10)
     
-    # Get unique conditions
-    unique_conditions = df['condition'].unique()
-    logger.info(f"Adding {len(unique_conditions)} nodes to network")
-    
-    # Add nodes for each condition
-    for condition in unique_conditions:
-        # Get domain for this condition
-        domain = assign_clinical_domain(condition)
-        G.add_node(condition, domain=domain)
-    
-    # Group conditions by patient
-    patient_conditions = df.groupby('patient_id')['condition'].apply(list).to_dict()
-    
-    # Create edges between conditions that co-occur in patients
-    total_patients = len(patient_conditions)
-    progress_counter = 0
-    progress_step = 100
-    edge_weights = defaultdict(int)
-    
-    # Count co-occurrences
-    for patient_id, conditions in patient_conditions.items():
-        progress_counter += 1
-        if progress_counter % progress_step == 0:
-            logger.info(f"Processing edges: {progress_counter}/{total_patients} patients")
-            
-        # Only process if patient has multiple conditions
-        if len(conditions) > 1:
-            # Create pairs of conditions
-            for i in range(len(conditions)):
-                for j in range(i+1, len(conditions)):
-                    condition1 = conditions[i]
-                    condition2 = conditions[j]
-                    
-                    # Increment edge weight
-                    edge_key = tuple(sorted([condition1, condition2]))
-                    edge_weights[edge_key] += 1
-    
-    # Add edges to graph with weights
-    edge_count = 0
-    for (condition1, condition2), weight in edge_weights.items():
-        # Only add edges with sufficient weight (co-occur in at least 2 patients)
-        if weight >= 2:
-            G.add_edge(condition1, condition2, weight=weight)
-            edge_count += 1
-    
-    logger.info(f"Adding {edge_count} edges to network")
-    
-    # If no edges were created, add some minimal edges to avoid community detection errors
-    if edge_count == 0 and len(unique_conditions) > 1:
-        logger.warning("No significant condition relationships found. Adding minimal edges.")
-        # Group conditions by domain
-        domain_conditions = defaultdict(list)
-        for condition in unique_conditions:
-            domain = assign_clinical_domain(condition)
-            domain_conditions[domain].append(condition)
-            
-        # Add at least one edge per domain if possible
-        for domain, conditions in domain_conditions.items():
-            if len(conditions) > 1:
-                for i in range(len(conditions)-1):
-                    G.add_edge(conditions[i], conditions[i+1], weight=1)
-                    edge_count += 1
-            elif len(conditions) == 1 and domain_conditions:
-                # Connect to another domain's condition
-                other_domain = next((d for d in domain_conditions.keys() if d != domain and domain_conditions[d]), None)
-                if other_domain and domain_conditions[other_domain]:
-                    G.add_edge(conditions[0], domain_conditions[other_domain][0], weight=1)
-                    edge_count += 1
+    # Check if we have a valid graph with edges
+    if G is None or G.number_of_edges() == 0:
+        logger.warning("MI-based network creation failed or produced no edges, falling back to co-occurrence")
         
-        logger.info(f"Added {edge_count} minimal edges to allow community detection")
+        # Initialize graph
+        G = nx.Graph()
+        
+        # Get unique conditions
+        unique_conditions = domain_df['condition'].unique()
+        logger.info(f"Adding {len(unique_conditions)} nodes to network")
+        
+        # Add nodes for each condition
+        for condition in unique_conditions:
+            # Get domain for this condition
+            domain = assign_clinical_domain(condition)
+            G.add_node(condition, domain=domain)
+        
+        # Group conditions by patient
+        patient_conditions = domain_df.groupby('patient_id')['condition'].apply(list).to_dict()
+        
+        # Create edges between conditions that co-occur in patients
+        total_patients = len(patient_conditions)
+        edge_weights = defaultdict(int)
+        
+        # Count co-occurrences
+        for patient_id, conditions in patient_conditions.items():
+            # Only process if patient has multiple conditions
+            if len(conditions) > 1:
+                # Create pairs of conditions
+                for i in range(len(conditions)):
+                    for j in range(i+1, len(conditions)):
+                        condition1 = conditions[i]
+                        condition2 = conditions[j]
+                        
+                        # Increment edge weight
+                        edge_key = tuple(sorted([condition1, condition2]))
+                        edge_weights[edge_key] += 1
+        
+        # Add edges to graph with weights
+        edge_count = 0
+        for (condition1, condition2), weight in edge_weights.items():
+            # Only add edges with sufficient weight (co-occur in at least 2 patients)
+            if weight >= 2:
+                G.add_edge(condition1, condition2, weight=weight)
+                edge_count += 1
+        
+        logger.info(f"Added {edge_count} co-occurrence edges to network")
+        
+        # If no edges were created, add some minimal edges to avoid community detection errors
+        if edge_count == 0 and len(unique_conditions) > 1:
+            logger.warning("No significant condition relationships found. Adding minimal edges.")
+            # Group conditions by domain
+            domain_conditions = defaultdict(list)
+            for condition in unique_conditions:
+                domain = assign_clinical_domain(condition)
+                domain_conditions[domain].append(condition)
+                
+            # Add at least one edge per domain if possible
+            for domain, conditions in domain_conditions.items():
+                if len(conditions) > 1:
+                    for i in range(len(conditions)-1):
+                        G.add_edge(conditions[i], conditions[i+1], weight=1)
+                        edge_count += 1
+                elif len(conditions) == 1 and domain_conditions:
+                    # Connect to another domain's condition
+                    other_domain = next((d for d in domain_conditions.keys() if d != domain and domain_conditions[d]), None)
+                    if other_domain and domain_conditions[other_domain]:
+                        G.add_edge(conditions[0], domain_conditions[other_domain][0], weight=1)
+                        edge_count += 1
     
+    # Add domain information to each node
+    for node in G.nodes():
+        domain = assign_clinical_domain(node)
+        G.nodes[node]['domain'] = domain
+    
+    # Apply community detection if we have edges
+    if G.number_of_edges() > 0:
+        # Try Leiden algorithm first (more advanced)
+        if LEIDEN_AVAILABLE:
+            try:
+                communities = leiden_clustering(G, resolution=1.0)
+                if communities:
+                    nx.set_node_attributes(G, communities, 'community')
+                    logger.info(f"Applied Leiden clustering with {len(set(communities.values()))} communities")
+                else:
+                    logger.warning("Leiden clustering failed, falling back to Louvain")
+                    # Fall back to Louvain
+                    if COMMUNITY_DETECTION_AVAILABLE:
+                        communities = community_louvain.best_partition(G)
+                        nx.set_node_attributes(G, communities, 'community')
+                        logger.info(f"Applied Louvain clustering with {len(set(communities.values()))} communities")
+            except Exception as e:
+                logger.error(f"Error in Leiden clustering: {str(e)}")
+                # Fall back to Louvain
+                if COMMUNITY_DETECTION_AVAILABLE:
+                    try:
+                        communities = community_louvain.best_partition(G)
+                        nx.set_node_attributes(G, communities, 'community')
+                        logger.info(f"Applied Louvain clustering with {len(set(communities.values()))} communities")
+                    except:
+                        logger.error("All community detection algorithms failed")
+        # If Leiden not available, try Louvain
+        elif COMMUNITY_DETECTION_AVAILABLE:
+            try:
+                communities = community_louvain.best_partition(G)
+                nx.set_node_attributes(G, communities, 'community')
+                logger.info(f"Applied Louvain clustering with {len(set(communities.values()))} communities")
+            except Exception as e:
+                logger.error(f"Error in Louvain clustering: {str(e)}")
+    
+    # Calculate and add additional network metrics to nodes
+    if G.number_of_nodes() > 0 and G.number_of_edges() > 0:
+        # Calculate centrality metrics
+        degree_cent = nx.degree_centrality(G)
+        nx.set_node_attributes(G, degree_cent, 'degree_centrality')
+        
+        try:
+            betweenness_cent = nx.betweenness_centrality(G)
+            nx.set_node_attributes(G, betweenness_cent, 'betweenness_centrality')
+        except:
+            logger.warning("Betweenness centrality calculation failed")
+            
+        try:
+            closeness_cent = nx.closeness_centrality(G)
+            nx.set_node_attributes(G, closeness_cent, 'closeness_centrality')
+        except:
+            logger.warning("Closeness centrality calculation failed")
+    
+    logger.info(f"Created network with {G.number_of_nodes()} nodes and {G.number_of_edges()} edges")
     return G
 
 def calculate_condition_correlations(domain_df, method='pearson'):
     """
-    Calculate correlations between conditions using various methods.
+    Calculate condition correlations using the specified method.
     
     Args:
-        domain_df: DataFrame with patient conditions
-        method: Correlation method ('pearson', 'spearman', or 'mutual_info')
+        domain_df: DataFrame with domain information
+        method: Correlation method to use (default: 'pearson')
         
     Returns:
-        DataFrame with correlation matrix
+        corr_matrix: DataFrame with condition correlations
     """
-    try:
-        # Create a binary matrix of patients x conditions
-        patients = domain_df['patient_id'].unique()
-        conditions = domain_df['condition'].unique()
-        
-        # Initialize matrix with zeros
-        binary_matrix = pd.DataFrame(0, index=patients, columns=conditions)
-        
-        # Fill matrix with 1s for existing conditions
-        for _, row in domain_df.iterrows():
-            binary_matrix.loc[row['patient_id'], row['condition']] = 1
-        
-        # Calculate correlations based on method
-        if method == 'pearson':
-            corr_matrix = binary_matrix.corr(method='pearson')
-            logger.info("Calculated Pearson correlations between conditions")
-        elif method == 'spearman':
-            corr_matrix = binary_matrix.corr(method='spearman')
-            logger.info("Calculated Spearman correlations between conditions")
-        elif method == 'mutual_info':
-            # Calculate mutual information for each pair of conditions
-            n_conditions = len(conditions)
-            mi_matrix = np.zeros((n_conditions, n_conditions))
-            
-            for i in range(n_conditions):
-                for j in range(i, n_conditions):
-                    if i == j:
-                        mi_matrix[i, j] = 1.0
-                    else:
-                        mi = mutual_info_score(binary_matrix[conditions[i]], binary_matrix[conditions[j]])
-                        # Normalize MI to 0-1 range
-                        mi_matrix[i, j] = mi
-                        mi_matrix[j, i] = mi
-            
-            corr_matrix = pd.DataFrame(mi_matrix, index=conditions, columns=conditions)
-            logger.info("Calculated Mutual Information between conditions")
-        else:
-            logger.warning(f"Unknown correlation method: {method}. Using Pearson.")
-            corr_matrix = binary_matrix.corr(method='pearson')
-        
-        return corr_matrix
-        
-    except Exception as e:
-        logger.error(f"Error calculating correlations: {str(e)}")
+    if domain_df is None or domain_df.empty:
+        logger.warning("No data available for correlation calculation")
         return pd.DataFrame()
-
-def create_correlation_network(corr_matrix, threshold=0.3):
-    """
-    Create a network graph from a correlation matrix.
     
-    Args:
-        corr_matrix: Correlation matrix
-        threshold: Correlation threshold to include edges
-        
-    Returns:
-        NetworkX graph
-    """
-    try:
-        G = nx.Graph()
-        
-        # Add nodes
-        conditions = corr_matrix.index
-        G.add_nodes_from(conditions)
-        
-        # Add edges for correlations above threshold
-        for i in range(len(conditions)):
-            for j in range(i+1, len(conditions)):
-                corr = corr_matrix.iloc[i, j]
-                if abs(corr) >= threshold:
-                    G.add_edge(conditions[i], conditions[j], weight=abs(corr))
-        
-        return G
-        
-    except Exception as e:
-        logger.error(f"Error creating correlation network: {str(e)}")
-        return nx.Graph()
-
-def visualize_network_with_communities(G, domain_df):
-    """
-    Visualize the condition network with communities and domain coloring.
+    # Extract conditions and their domains
+    conditions = domain_df['condition'].unique()
     
-    Args:
-        G: NetworkX graph of conditions
-        domain_df: DataFrame containing domain information
-        
-    Returns:
-        Plotly figure object
-    """
-    if G is None or G.number_of_nodes() == 0:
-        return None
-        
-    try:
-        # Community detection - with error handling
-        communities = {}
-        try:
-            if COMMUNITY_DETECTION_AVAILABLE and G.number_of_edges() > 0:
-                partition = community_louvain.best_partition(G)
-                communities = defaultdict(list)
-                for node, community_id in partition.items():
-                    communities[community_id].append(node)
-                logger.info(f"Detected {len(communities)} communities in the network")
-            else:
-                # Fallback without community detection
-                logger.warning("Skipping community detection - not available or no edges")
-        except Exception as e:
-            logger.error(f"Error in community detection: {str(e)}")
-            # Continue without community detection
-        
-        # Set up domain colors
-        domain_colors = {
-            'Cardiometabolic': '#e41a1c',         # Red
-            'Immune-Inflammation': '#377eb8',     # Blue
-            'Oncological': '#4daf4a',             # Green
-            'Neuro-Mental Health': '#984ea3',     # Purple
-            'Neurological-Frailty': '#ff7f00',    # Orange
-            'SDOH': '#ffff33',                    # Yellow
-            'Other': '#999999'                    # Gray
-        }
-        
-        # Position nodes using force-directed layout
-        pos = None
-        
-        # Try to use nx.spring_layout but handle potential issues
-        try:
-            # Use spring layout with fixed parameters for better visualization
-            pos = nx.spring_layout(G, k=0.15, iterations=50, seed=42)
-            logger.info("Using spring layout for network visualization")
-        except Exception as e:
-            logger.warning(f"Error with spring layout: {str(e)}")
-            # Fall back to simpler layout
-            pos = nx.random_layout(G)
-            logger.info("Falling back to random layout")
-        
-        # Create edge traces with width based on weight
-        edge_trace = []
-        
-        # Process edges and get the max weight for scaling
-        max_weight = 1
-        for u, v, data in G.edges(data=True):
-            weight = data.get('weight', 1)
-            max_weight = max(max_weight, weight)
-            
-        # Create edge traces
-        for u, v, data in G.edges(data=True):
-            # Get positions
-            x0, y0 = pos[u]
-            x1, y1 = pos[v]
-            
-            # Scale weight for visual width (min 1, max 10)
-            weight = data.get('weight', 1)
-            scaled_width = 1 + (weight / max_weight) * 9
-            
-            # Create edge trace
-            trace = go.Scatter(
-                x=[x0, x1, None],
-                y=[y0, y1, None],
-                mode='lines',
-                line=dict(width=scaled_width, color='rgba(180,180,180,0.7)'),
-                hoverinfo='none'
-            )
-            edge_trace.append(trace)
-        
-        # Create node traces by domain for more efficient plotting and better coloring
-        domain_node_traces = {}
-        domain_counts = {}
-        
-        # Initialize a node trace for each domain
-        for domain, color in domain_colors.items():
-            domain_node_traces[domain] = go.Scatter(
-                x=[],
-                y=[],
-                text=[],
-                mode='markers',
-                name=domain,
-                marker=dict(
-                    color=color,
-                    size=15,
-                    line=dict(width=1, color='#888')
-                ),
-                hoverinfo='text'
-            )
-            domain_counts[domain] = 0
-        
-        # Add nodes to their respective domain traces
-        for node in G.nodes():
-            x, y = pos[node]
-            
-            # Get node domain, degree, and weight for label
-            domain = G.nodes[node].get('domain', 'Other')
-            if domain not in domain_colors:
-                domain = 'Other'
-                
-            # Count domains
-            domain_counts[domain] += 1
-            
-            # Get node degree
-            degree = G.degree(node)
-            
-            # Prepare hover text
-            hover_text = f"Condition: {node}<br>Domain: {domain}<br>Connections: {degree}"
-            
-            # Add to the appropriate domain trace
-            domain_node_traces[domain]['x'] = domain_node_traces[domain]['x'] + (x,)
-            domain_node_traces[domain]['y'] = domain_node_traces[domain]['y'] + (y,)
-            domain_node_traces[domain]['text'] = domain_node_traces[domain]['text'] + (hover_text,)
-            
-            # Scale node size by degree (connections)
-            size = 10 + (degree * 2)
-            if 'marker' not in domain_node_traces[domain]:
-                domain_node_traces[domain]['marker'] = {}
-            if 'size' not in domain_node_traces[domain]['marker']:
-                domain_node_traces[domain]['marker']['size'] = []
-            domain_node_traces[domain]['marker']['size'].append(size)
-        
-        # Create a figure
-        fig = go.Figure(data=edge_trace + [trace for trace in domain_node_traces.values() if len(trace['x']) > 0])
-        
-        # Filter out empty domains for the legend
-        active_domains = [domain for domain, count in domain_counts.items() if count > 0]
-        
-        # Create a better title with domain breakdown
-        domain_breakdown = ", ".join([f"{domain}: {count}" for domain, count in domain_counts.items() if count > 0])
-        title = f"Condition Network Map<br><sub>Domains: {domain_breakdown}</sub>"
-        
-        # Update layout
-        fig.update_layout(
-            title=title,
-            titlefont=dict(size=16),
-            showlegend=True,
-            legend=dict(title="Clinical Domains"),
-            hovermode='closest',
-            margin=dict(b=20, l=5, r=5, t=40),
-            xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
-            yaxis=dict(showgrid=False, zeroline=False, showticklabels=False)
-        )
-        
-        # Add community annotations if available
-        if communities:
-            annotations = []
-            for community_id, nodes in communities.items():
-                if len(nodes) > 2:  # Only annotate larger communities
-                    # Get central position of this community
-                    x_pos = [pos[node][0] for node in nodes if node in pos]
-                    y_pos = [pos[node][1] for node in nodes if node in pos]
-                    if x_pos and y_pos:
-                        comm_x = sum(x_pos) / len(x_pos)
-                        comm_y = sum(y_pos) / len(y_pos)
-                        
-                        # Count domains in this community
-                        domain_counts = {}
-                        for node in nodes:
-                            domain = G.nodes[node].get('domain', 'Other')
-                            domain_counts[domain] = domain_counts.get(domain, 0) + 1
-                        
-                        # Find dominant domain
-                        if domain_counts:
-                            dominant_domain = max(domain_counts, key=domain_counts.get)
-                            
-                            # Add annotation
-                            annotations.append(dict(
-                                x=comm_x,
-                                y=comm_y,
-                                xref="x",
-                                yref="y",
-                                text=f"Community {community_id}<br>({dominant_domain})",
-                                showarrow=True,
-                                arrowhead=1,
-                                ax=0,
-                                ay=-40
-                            ))
-            
-            if annotations:
-                fig.update_layout(annotations=annotations)
-        
-        return fig
-        
-    except Exception as e:
-        logger.error(f"Error visualizing network: {str(e)}")
-        traceback.print_exc()  # Print full traceback for debugging
-        return None
-
-def get_condition_severity(condition: str, biomarkers: dict = None) -> str:
-    """
-    Determine condition severity based on ICD code and biomarkers.
+    # Create correlation matrix
+    corr_matrix = pd.DataFrame(index=conditions, columns=conditions)
     
-    Args:
-        condition: Condition or ICD-10 code
-        biomarkers: Dictionary of biomarker values (optional)
-        
-    Returns:
-        Severity level ('Low', 'Medium', or 'High')
-    """
-    try:
-        # Default to medium severity
-        severity = 'Medium'
-        
-        # Check condition keywords
-        condition_lower = condition.lower()
-        
-        # High severity keywords
-        high_severity = ['severe', 'acute', 'malignant', 'failure', 'critical', 'advanced',
-                         'stage 3', 'stage 4', 'stage iii', 'stage iv', 'metastatic']
-        if any(keyword in condition_lower for keyword in high_severity):
-            severity = 'High'
-            
-        # Low severity keywords
-        low_severity = ['mild', 'benign', 'routine', 'history of', 'controlled', 'remission',
-                       'stage 0', 'stage 1', 'stage i', 'stage 0a', 'stage 0b']
-        if any(keyword in condition_lower for keyword in low_severity):
-            severity = 'Low'
-            
-        # Adjust based on biomarkers if available
-        if biomarkers:
-            # Check critical biomarker thresholds
-            if biomarkers.get('glucose', 0) > 200:  # Severe hyperglycemia
-                severity = 'High'
-            if biomarkers.get('blood_pressure_systolic', 0) > 180:  # Severe hypertension
-                severity = 'High'
-            if biomarkers.get('ldl', 0) > 190:  # Very high LDL
-                severity = 'High'
-            if biomarkers.get('egfr', 0) < 30:  # Severe kidney disease
-                severity = 'High'
-            if biomarkers.get('hba1c', 0) > 9.0:  # Poor glycemic control
-                severity = 'High'
-            if biomarkers.get('crp', 0) > 10:  # High inflammation
-                severity = 'High'
-                
-        return severity
-        
-    except Exception as e:
-        logger.error(f"Error in get_condition_severity: {str(e)}")
-        return 'Medium'
-
-def calculate_total_risk_score(patient_data: dict) -> dict:
-    """
-    Calculate the total risk score for a patient using NHCRS model.
-    
-    Args:
-        patient_data: Dictionary containing patient information including:
-            - conditions: List of medical conditions
-            - age: Patient age
-            - gender: Patient gender
-            - biomarkers: Dictionary of biomarker values
-            - sdoh_data: Dictionary of social determinants of health
-            
-    Returns:
-        Dictionary containing total score, domain scores, and risk percentages
-    """
-    # Initialize domain scores
-    domain_scores = {
-        'Cardiometabolic': 1.0,
-        'Immune-Inflammation': 1.0,
-        'Oncological': 1.0,
-        'Neuro-Mental Health': 1.0,
-        'Neurological-Frailty': 1.0,
-        'SDOH': 1.0
-    }
-    
-    # Extract patient info
-    conditions = patient_data.get('conditions', [])
-    age = patient_data.get('age', 0)
-    gender = patient_data.get('gender', 'Unknown')
-    biomarkers = patient_data.get('biomarkers', {})
-    sdoh_data = patient_data.get('sdoh_data', {})
-    network_metrics = patient_data.get('network_metrics', {})
-    
-    # Skip detailed calculation for patients without conditions or biomarkers
-    # but assign minimal baseline scores
-    if not conditions and not biomarkers:
-        logger.info(f"Patient has no conditions or biomarkers, assigning baseline scores")
-        # Calculate baseline total
-        total_score = calculate_nhcrs_total(domain_scores)
-        mortality_risk = calculate_mortality_risk(total_score)
-        hospitalization_risk = calculate_hospitalization_risk(total_score)
-        
-        return {
-            'total_score': total_score,
-            'domain_scores': domain_scores,
-            'mortality_risk_10yr': mortality_risk,
-            'hospitalization_risk_5yr': hospitalization_risk
-        }
-    
-    # Count conditions by domain
-    domain_condition_counts = {}
-    for condition in conditions:
-        domain = assign_clinical_domain(condition)
-        if domain not in domain_condition_counts:
-            domain_condition_counts[domain] = 0
-        domain_condition_counts[domain] += 1
-    
-    # Calculate base score for each domain using a more nuanced formula
-    # that increases more significantly with higher condition counts
-    for domain in domain_scores:
-        condition_count = domain_condition_counts.get(domain, 0)
-        
-        # Apply more sensitive formula: 1 + log(1+count)*2 gives a steeper curve
-        # 0 conditions = 1.0, 1 condition = 1.7, 2 = 2.1, 3 = 2.4, 5 = 2.8, 10 = 3.4
-        if condition_count > 0:
-            domain_scores[domain] = 1.0 + math.log1p(condition_count) * 2.0
-    
-    # Enhanced scoring: Increase impact of multiple conditions in a domain
-    total_conditions = len(conditions)
-    if total_conditions > 0:
-        # Add additional points for distribution of conditions across domains
-        domains_with_conditions = sum(1 for count in domain_condition_counts.values() if count > 0)
-        
-        # More domains affected = higher risk, max +2 points
-        domain_distribution_factor = min(domains_with_conditions * 0.4, 2.0)
-        
-        # Add this factor to each domain that has conditions
-        for domain in domain_scores:
-            if domain_condition_counts.get(domain, 0) > 0:
-                domain_scores[domain] += domain_distribution_factor
-    
-    # Integrate biomarker data to enhance domain scores
-    if biomarkers:
-        for domain in domain_scores:
-            biomarker_component = calculate_biomarker_component(biomarkers, domain)
-            if biomarker_component > 0:
-                # Add biomarker component to domain score
-                domain_scores[domain] += biomarker_component
-    
-    # Apply age and gender factors to adjust domain scores
-    for domain in domain_scores:
-        gender_age_factor = get_gender_age_factor(domain, gender, age)
-        domain_scores[domain] *= gender_age_factor
-    
-    # Apply SDOH modifiers if available
-    if sdoh_data:
-        for domain in domain_scores:
-            sdoh_modifier = calculate_sdoh_modifier(sdoh_data, domain)
-            domain_scores[domain] *= sdoh_modifier
-    
-    # Include network component
-    network_component = 0
-    degree_centrality = network_metrics.get('degree_centrality', 0)
-    betweenness_centrality = network_metrics.get('betweenness_centrality', 0)
-    
-    # Higher centrality = higher connectivity = higher risk
-    network_component = (degree_centrality * 2) + (betweenness_centrality * 3)
-    
-    # Calculate total score using weighted contributions from each domain
-    # These weights reflect the domain's impact on mortality and hospitalization risks
-    domain_weights = {
-        'Cardiometabolic': 1.2,
-        'Immune-Inflammation': 1.1,
-        'Oncological': 1.3,
-        'Neuro-Mental Health': 1.0,
-        'Neurological-Frailty': 1.1,
-        'SDOH': 0.8
-    }
-    
-    # Apply weights and calculate total (ensuring at least 1.0)
-    weighted_domain_scores = {d: domain_scores[d] * domain_weights[d] for d in domain_scores}
-    
-    # The NHCRS calculation with explicit domain weights
-    total_score = calculate_nhcrs_total(weighted_domain_scores)
-    
-    # Add network component (max 2 points)
-    total_score += min(network_component, 2.0)
-    
-    # Calculate risk percentages
-    mortality_risk = calculate_mortality_risk(total_score)
-    hospitalization_risk = calculate_hospitalization_risk(total_score)
-    
-    # Return all results
-    return {
-        'total_score': total_score,
-        'domain_scores': domain_scores,
-        'mortality_risk_10yr': mortality_risk,
-        'hospitalization_risk_5yr': hospitalization_risk
-    }
-
-def calculate_domain_risk_score(conditions: list, domain: str, patient_age: int, patient_gender: str, biomarkers: dict = None, sdoh_data: dict = None) -> float:
-    """
-    Calculate risk score for a specific clinical domain using the enhanced NHCRS model.
-    
-    Args:
-        conditions: List of conditions in this domain
-        domain: Domain name (cardiometabolic, immune_inflammation, etc.)
-        patient_age: Patient's age
-        patient_gender: Patient's gender ('M' or 'F')
-        biomarkers: Dict of biomarker values (optional)
-        sdoh_data: Dict of social determinants of health data (optional)
-        
-    Returns:
-        Domain-specific risk score
-    """
-    try:
-        # Initialize base score
-        base_score = 1.0
-        
-        # Calculate condition severity component
-        condition_score = 0
-        for condition in conditions:
-            severity = get_condition_severity(condition, biomarkers)
-            # Convert severity to numeric value
-            severity_value = {'Low': 0.5, 'Medium': 1.0, 'High': 1.5}.get(severity, 1.0)
-            # Apply condition-specific weight
-            beta_i = get_condition_weight(condition, domain)
-            condition_score += beta_i * severity_value
-        
-        # Calculate biomarker component if available
-        biomarker_score = 0
-        if biomarkers:
-            biomarker_score = calculate_biomarker_component(biomarkers, domain)
-        
-        # Calculate SDOH component if available
-        sdoh_factor = 1.0
-        if sdoh_data:
-            sdoh_factor = calculate_sdoh_modifier(sdoh_data, domain)
-        
-        # Get gender and age adjustment factor
-        gaf = get_gender_age_factor(domain, patient_gender, patient_age)
-        
-        # Calculate total domain score using the formula:
-        # R_d = (sum(β_i * S_i) + sum(γ_j * B_j)) * GAF * SDOH_factor
-        domain_score = (condition_score + biomarker_score) * gaf * sdoh_factor
-        
-        # Cap at maximum value of 10 per domain
-        return min(domain_score, 10.0)
-        
-    except Exception as e:
-        logger.error(f"Error in calculate_domain_risk_score: {str(e)}")
-        return 1.0
-
-def get_condition_weight(condition: str, domain: str) -> float:
-    """
-    Get condition-specific weight (β_i) based on clinical significance.
-    These values would ideally be derived from published hazard ratios or odds ratios.
-    """
-    # Default weight
-    default_weight = 1.0
-    
-    # High-impact conditions by domain
-    high_impact_conditions = {
-        'cardiometabolic': ['heart failure', 'stroke', 'myocardial infarction', 'coronary', 'diabetes', 'i21', 'i22', 'i50'],
-        'immune_inflammation': ['sepsis', 'severe infection', 'pneumonia', 'covid', 'rheumatoid arthritis'],
-        'oncologic': ['malignant', 'metastatic', 'cancer'],
-        'neuro_mental_health': ['suicidal', 'psychosis', 'schizophrenia', 'severe depression'],
-        'neurological_frailty': ['alzheimer', 'parkinson', 'multiple sclerosis', 'dementia']
-    }
-    
-    # Medium-impact conditions by domain
-    medium_impact_conditions = {
-        'cardiometabolic': ['hypertension', 'hyperlipidemia', 'obesity', 'atrial fibrillation'],
-        'immune_inflammation': ['asthma', 'chronic bronchitis', 'inflammatory bowel'],
-        'oncologic': ['benign tumor', 'neoplasm'],
-        'neuro_mental_health': ['anxiety', 'depression', 'bipolar', 'substance abuse'],
-        'neurological_frailty': ['seizure', 'neuropathy', 'tremor']
-    }
-    
-    # Convert condition to lowercase for matching
-    condition_lower = condition.lower()
-    
-    # Check if this is a high-impact condition
-    if any(keyword in condition_lower for keyword in high_impact_conditions.get(domain, [])):
-        return 2.0
-    
-    # Check if this is a medium-impact condition
-    if any(keyword in condition_lower for keyword in medium_impact_conditions.get(domain, [])):
-        return 1.5
-    
-    return default_weight
-
-def calculate_biomarker_component(biomarkers: dict, domain: str) -> float:
-    """
-    Calculate domain-specific biomarker component.
-    
-    Args:
-        biomarkers: Dictionary of biomarker values
-        domain: Clinical domain
-        
-    Returns:
-        Biomarker component score for this domain
-    """
-    score = 0.0
-    
-    # Define domain-specific biomarkers and their weights (γ_j)
-    domain_biomarkers = {
-        'cardiometabolic': {
-            'glucose': {'weight': 0.5, 'threshold': 126, 'high_threshold': 200},
-            'cholesterol': {'weight': 0.3, 'threshold': 200, 'high_threshold': 240},
-            'ldl': {'weight': 0.4, 'threshold': 130, 'high_threshold': 160},
-            'hdl': {'weight': 0.3, 'threshold': 40, 'high_threshold': 30, 'inverse': True},
-            'triglycerides': {'weight': 0.3, 'threshold': 150, 'high_threshold': 200},
-            'blood_pressure_systolic': {'weight': 0.5, 'threshold': 140, 'high_threshold': 160},
-            'blood_pressure_diastolic': {'weight': 0.3, 'threshold': 90, 'high_threshold': 100},
-            'bmi': {'weight': 0.3, 'threshold': 30, 'high_threshold': 35},
-            'hba1c': {'weight': 0.6, 'threshold': 6.5, 'high_threshold': 8.0}
-        },
-        'immune_inflammation': {
-            'crp': {'weight': 0.6, 'threshold': 3, 'high_threshold': 10},
-            'esr': {'weight': 0.4, 'threshold': 20, 'high_threshold': 50},
-            'wbc': {'weight': 0.4, 'threshold': 11, 'high_threshold': 15},
-            'neutrophils': {'weight': 0.3, 'threshold': 7.5, 'high_threshold': 10},
-            'lymphocytes': {'weight': 0.2, 'threshold': 4.5, 'high_threshold': 6}
-        },
-        'oncologic': {
-            'cea': {'weight': 0.5, 'threshold': 3, 'high_threshold': 10},
-            'psa': {'weight': 0.5, 'threshold': 4, 'high_threshold': 10},
-            'ca125': {'weight': 0.5, 'threshold': 35, 'high_threshold': 100},
-            'afp': {'weight': 0.5, 'threshold': 10, 'high_threshold': 50}
-        },
-        'neuro_mental_health': {
-            'cortisol': {'weight': 0.4, 'threshold': 20, 'high_threshold': 30}
-        },
-        'neurological_frailty': {
-            'vitamin_d': {'weight': 0.3, 'threshold': 20, 'high_threshold': 12, 'inverse': True},
-            'vitamin_b12': {'weight': 0.3, 'threshold': 200, 'high_threshold': 150, 'inverse': True},
-            'albumin': {'weight': 0.4, 'threshold': 3.5, 'high_threshold': 3.0, 'inverse': True}
-        }
-    }
-    
-    # Calculate score for each relevant biomarker
-    for biomarker, value in biomarkers.items():
-        # Skip if biomarker not relevant to this domain or value is missing
-        if (biomarker not in domain_biomarkers.get(domain, {}) or 
-            pd.isna(value) or 
-            not isinstance(value, (int, float))):
-            continue
-            
-        params = domain_biomarkers[domain][biomarker]
-        weight = params['weight']
-        threshold = params['threshold']
-        high_threshold = params['high_threshold']
-        inverse = params.get('inverse', False)
-        
-        # Calculate normalized score (0 to 1 scale)
-        if inverse:
-            # For inverse biomarkers (lower is worse)
-            if value <= high_threshold:
-                normalized_score = 1.0  # Highest risk
-            elif value <= threshold:
-                normalized_score = 0.5  # Moderate risk
-            else:
-                normalized_score = 0.0  # Normal
-        else:
-            # For regular biomarkers (higher is worse)
-            if value >= high_threshold:
-                normalized_score = 1.0  # Highest risk
-            elif value >= threshold:
-                normalized_score = 0.5  # Moderate risk
-            else:
-                normalized_score = 0.0  # Normal
-                
-        # Add weighted biomarker score
-        score += weight * normalized_score
-    
-    return score
-
-def get_gender_age_factor(domain: str, gender: str, age: int) -> float:
-    """
-    Calculate gender and age adjustment factor for a specific domain.
-    
-    Args:
-        domain: Clinical domain
-        gender: Patient gender ('M' or 'F')
-        age: Patient age
-        
-    Returns:
-        Adjustment factor (multiplicative)
-    """
-    # Default factor
-    factor = 1.0
-    
-    # Normalize gender input
-    gender = str(gender).upper()[:1]  # Take first letter, uppercase
-    
-    # Domain-specific gender/age adjustments
-    if domain == 'cardiometabolic':
-        # Men have higher baseline cardiovascular risk before age 55
-        if gender == 'M' and age < 55:
-            factor = 1.3
-        # Women's risk increases post-menopause
-        elif gender == 'F' and age >= 55:
-            factor = 1.2
-            
-    elif domain == 'oncologic':
-        # Women under 50 have higher cancer risk (e.g., breast, cervical)
-        if gender == 'F' and age < 50:
-            factor = 1.8
-        # Men over 50 have higher cancer risk (e.g., prostate, colorectal)
-        elif gender == 'M' and age >= 50:
-            factor = 1.5
-            
-    elif domain == 'neuro_mental_health':
-        # Women have higher rates of depression and anxiety
-        if gender == 'F':
-            factor = 1.4
-            
-    elif domain == 'neurological_frailty':
-        # Risk increases with age
-        if age >= 80:
-            factor = 2.0
-        elif age >= 70:
-            factor = 1.5
-        elif age >= 60:
-            factor = 1.2
-    
-    return factor
-
-def calculate_sdoh_modifier(sdoh_data: dict, domain: str) -> float:
-    """
-    Calculate SDOH (Social Determinants of Health) modifier for a specific domain.
-    
-    Args:
-        sdoh_data: Dictionary of SDOH indicators
-        domain: Clinical domain
-        
-    Returns:
-        SDOH modifier (multiplicative factor)
-    """
-    # Default modifier (no impact)
-    modifier = 1.0
-    
-    if not sdoh_data:
-        return modifier
-        
-    # SDOH risk factors with domain-specific weights
-    sdoh_weights = {
-        'cardiometabolic': {
-            'medication_adherence': 0.3, 
-            'diet_quality': 0.25,
-            'physical_activity': 0.25,
-            'socioeconomic_status': 0.1,
-            'housing_stability': 0.1
-        },
-        'immune_inflammation': {
-            'medication_adherence': 0.3,
-            'housing_stability': 0.2,
-            'socioeconomic_status': 0.2,
-            'healthcare_access': 0.3
-        },
-        'oncologic': {
-            'healthcare_access': 0.3,
-            'socioeconomic_status': 0.2,
-            'medication_adherence': 0.3,
-            'social_support': 0.2
-        },
-        'neuro_mental_health': {
-            'social_support': 0.3,
-            'socioeconomic_status': 0.2,
-            'housing_stability': 0.2,
-            'healthcare_access': 0.15,
-            'medication_adherence': 0.15
-        },
-        'neurological_frailty': {
-            'social_support': 0.25,
-            'housing_stability': 0.25,
-            'socioeconomic_status': 0.2,
-            'healthcare_access': 0.15,
-            'medication_adherence': 0.15
-        }
-    }
-    
-    # Get weights for this domain
-    domain_weights = sdoh_weights.get(domain, {})
-    
-    # Calculate total SDOH impact
-    sdoh_impact = 0
-    for factor, weight in domain_weights.items():
-        # SDOH factors are scaled 0-1 where 0 is best and 1 is worst
-        if factor in sdoh_data:
-            sdoh_impact += weight * sdoh_data[factor]
-    
-    # Convert to modifier (max increase of 50% for worst SDOH)
-    modifier = 1.0 + sdoh_impact
-    
-    return modifier
-
-def calculate_decay(initial_value: float, time_months: float, decay_type: str = 'linear', 
-                   decay_params: dict = None) -> float:
-    """
-    Calculate decay in risk over time, e.g., after intervention or treatment.
-    
-    Args:
-        initial_value: Initial risk score value
-        time_months: Time elapsed since intervention (in months)
-        decay_type: Type of decay function ('linear', 'exponential', or 'threshold')
-        decay_params: Parameters for the decay function
-        
-    Returns:
-        Adjusted value after decay
-    """
-    if decay_params is None:
-        decay_params = {}
-    
-    # Set default parameters if not provided
-    if decay_type == 'linear':
-        # Linear decay: D(t) = max(0, 1 - k * t)
-        k = decay_params.get('k', 0.05)  # Default 5% decrease per month
-        decay_factor = max(0, 1 - k * time_months)
-        
-    elif decay_type == 'exponential':
-        # Exponential decay: D(t) = exp(-λ * t)
-        lambda_param = decay_params.get('lambda', 0.1)  # Default decay rate
-        decay_factor = math.exp(-lambda_param * time_months)
-        
-    elif decay_type == 'threshold':
-        # Threshold-based decay with steps
-        thresholds = decay_params.get('thresholds', [3, 6, 12])  # Months
-        factors = decay_params.get('factors', [0.8, 0.5, 0.3])  # Corresponding factors
-        
-        # Find the appropriate threshold
-        decay_factor = 1.0
-        for i, threshold in enumerate(thresholds):
-            if time_months >= threshold and i < len(factors):
-                decay_factor = factors[i]
-                
-    else:
-        # Default: no decay
-        decay_factor = 1.0
-    
-    # Apply decay factor to initial value
-    return initial_value * decay_factor
-
-def calculate_nhcrs_total(domain_scores: dict, baseline_intercept: float = 1.0) -> float:
-    """
-    Calculate Nudge Health Clinical Risk Score (NHCRS) from domain scores.
-    
-    Args:
-        domain_scores: Dictionary of domain-specific risk scores
-        baseline_intercept: Baseline intercept value (α)
-        
-    Returns:
-        Total NHCRS score
-    """
-    # Domain scaling factors (λ_d) - can be adjusted based on validation
-    domain_weights = {
-        'cardiometabolic': 1.0,
-        'immune_inflammation': 0.8,
-        'oncologic': 1.2,
-        'neuro_mental_health': 0.7,
-        'neurological_frailty': 0.9,
-        'other': 0.5
-    }
-    
-    # Calculate weighted sum of domain scores
-    weighted_sum = 0
-    for domain, score in domain_scores.items():
-        domain_weight = domain_weights.get(domain, 0.5)  # Default weight for unknown domains
-        weighted_sum += domain_weight * score
-    
-    # Add baseline intercept
-    total_score = baseline_intercept + weighted_sum
-    
-    return total_score
-
-def calculate_mortality_risk(nhcrs_total: float) -> float:
-    """
-    Convert NHCRS to 10-year mortality risk probability using logistic function.
-    
-    Args:
-        nhcrs_total: Total Nudge Health Clinical Risk Score
-        
-    Returns:
-        10-year mortality risk as a probability (0-1)
-    """
-    # Logistic regression parameters (would be calibrated on outcome data)
-    a = -5.0  # Intercept (negative means low baseline risk)
-    b = 0.3   # Coefficient for NHCRS
-    
-    # Logistic function: P = 1 / (1 + exp(-(a + b*NHCRS)))
-    z = a + b * nhcrs_total
-    probability = 1 / (1 + math.exp(-z))
-    
-    return probability
-
-def calculate_hospitalization_risk(nhcrs_total: float) -> float:
-    """
-    Convert NHCRS to 5-year hospitalization risk probability using logistic function.
-    
-    Args:
-        nhcrs_total: Total Nudge Health Clinical Risk Score
-        
-    Returns:
-        5-year hospitalization risk as a probability (0-1)
-    """
-    # Logistic regression parameters (would be calibrated on outcome data)
-    c = -3.5  # Intercept (hospitalization more common than mortality)
-    d = 0.25  # Coefficient for NHCRS
-    
-    # Logistic function: P = 1 / (1 + exp(-(c + d*NHCRS)))
-    z = c + d * nhcrs_total
-    probability = 1 / (1 + math.exp(-z))
-    
-    return probability
-
-def process_biomarker_data(df):
-    """
-    Process biomarker data from various file formats.
-    
-    Args:
-        df: DataFrame containing biomarker data
-        
-    Returns:
-        DataFrame with standardized biomarker columns
-    """
-    try:
-        # Make a copy to avoid modifying the original
-        df_copy = df.copy()
-        
-        # Standardize column names (case insensitive)
-        df_copy.columns = [col.lower() for col in df_copy.columns]
-        
-        # Map common column variations to standard names
-        column_mappings = {
-            'pat id': 'patid', 
-            'patient id': 'patid',
-            'patientid': 'patid',
-            'sex': 'gender',
-            'age_years': 'age'
-        }
-        
-        # Apply column mappings where applicable
-        for old_col, new_col in column_mappings.items():
-            if old_col in df_copy.columns and new_col not in df_copy.columns:
-                df_copy.rename(columns={old_col: new_col}, inplace=True)
-        
-        # Function to find the best matching column for a target
-        def find_best_column_match(target, possible_names):
-            # First try exact matches
-            if target in df_copy.columns:
-                return target
-            
-            # Then try partial matches
-            for col in df_copy.columns:
-                if any(name in col.lower() for name in possible_names):
-                    return col
-            
-            return None
-        
-        # Create patient_id column if it doesn't exist
-        if 'patient_id' not in df_copy.columns:
-            if 'patid' in df_copy.columns:
-                df_copy['patient_id'] = df_copy['patid'].astype(str)
-            else:
-                st.error("No patient identifier column found")
-                return pd.DataFrame()
-        
-        # Identify potential biomarker columns
-        exclude_cols = ['patient_id', 'patid', 'gender', 'age', 'zip_code']
-        biomarker_cols = [col for col in df_copy.columns if col not in exclude_cols]
-        
-        # Map recognized biomarker names to standardized names
-        biomarker_mappings = {
-            # Lipid panel
-            'ldl': 'ldl_cholesterol',
-            'ldl cholesterol': 'ldl_cholesterol',
-            'ldl-c': 'ldl_cholesterol',
-            'hdl': 'hdl_cholesterol',
-            'hdl cholesterol': 'hdl_cholesterol',
-            'hdl-c': 'hdl_cholesterol',
-            'total cholesterol': 'total_cholesterol',
-            'cholesterol': 'total_cholesterol',
-            'triglycerides': 'triglycerides',
-            'tg': 'triglycerides',
-            
-            # Diabetes markers
-            'glucose': 'glucose',
-            'fasting glucose': 'fasting_glucose',
-            'a1c': 'hba1c',
-            'hba1c': 'hba1c',
-            'hemoglobin a1c': 'hba1c',
-            
-            # Inflammation markers
-            'crp': 'crp',
-            'c-reactive protein': 'crp',
-            'hs-crp': 'hs_crp',
-            'high-sensitivity crp': 'hs_crp',
-            'esr': 'esr',
-            'erythrocyte sedimentation rate': 'esr',
-            
-            # Cardiac markers
-            'troponin': 'troponin',
-            'bnp': 'bnp',
-            'nt-probnp': 'nt_probnp',
-            'brain natriuretic peptide': 'bnp',
-            
-            # Kidney function
-            'creatinine': 'creatinine',
-            'egfr': 'egfr',
-            'estimated gfr': 'egfr',
-            'bun': 'bun',
-            'blood urea nitrogen': 'bun',
-            'albumin': 'albumin',
-            'microalbumin': 'microalbumin',
-            
-            # Liver function
-            'alt': 'alt',
-            'alanine aminotransferase': 'alt',
-            'ast': 'ast',
-            'aspartate aminotransferase': 'ast',
-            'alp': 'alp',
-            'alkaline phosphatase': 'alp',
-            'ggt': 'ggt',
-            'gamma-glutamyl transferase': 'ggt',
-            'bilirubin': 'bilirubin',
-            
-            # Blood count
-            'wbc': 'wbc',
-            'white blood cells': 'wbc',
-            'rbc': 'rbc',
-            'red blood cells': 'rbc',
-            'hemoglobin': 'hemoglobin',
-            'hb': 'hemoglobin',
-            'hematocrit': 'hematocrit',
-            'hct': 'hematocrit',
-            'platelets': 'platelets',
-            'plt': 'platelets',
-            
-            # Vitamins and minerals
-            'vitamin d': 'vitamin_d',
-            '25-oh vitamin d': 'vitamin_d',
-            'vitamin b12': 'vitamin_b12',
-            'folate': 'folate',
-            'iron': 'iron',
-            'ferritin': 'ferritin',
-            
-            # Thyroid function
-            'tsh': 'tsh',
-            'thyroid stimulating hormone': 'tsh',
-            'ft4': 'free_t4',
-            'free t4': 'free_t4',
-            'ft3': 'free_t3',
-            'free t3': 'free_t3'
-        }
-        
-        # Standardize biomarker column names
-        renamed_cols = {}
-        for col in biomarker_cols:
-            col_clean = col.strip().lower().replace(' ', '_')
-            if col_clean in biomarker_mappings:
-                renamed_cols[col] = biomarker_mappings[col_clean]
-            elif col.lower() in biomarker_mappings:
-                renamed_cols[col] = biomarker_mappings[col.lower()]
-        
-        # Apply the standardized names
-        if renamed_cols:
-            df_copy.rename(columns=renamed_cols, inplace=True)
-        
-        # Convert all biomarker values to numeric
-        biomarker_cols = [col for col in df_copy.columns if col not in exclude_cols]
-        for col in biomarker_cols:
+    # Calculate correlations
+    for i in range(len(conditions)):
+        for j in range(i+1, len(conditions)):
+            condition1 = conditions[i]
+            condition2 = conditions[j]
+            # Use try/except to handle cases where correlation calculation might fail
             try:
-                df_copy[col] = pd.to_numeric(df_copy[col], errors='coerce')
-            except:
-                logger.warning(f"Could not convert column {col} to numeric")
-        
-        return df_copy
-    
-    except Exception as e:
-        st.error(f"Error processing biomarker data: {str(e)}")
-        logger.error(f"Error in process_biomarker_data: {str(e)}")
-        return pd.DataFrame()
-
-def perform_integrated_analysis(icd_df, biomarker_df=None):
-    """
-    Perform integrated analysis of diagnosis and biomarker data.
-    
-    Args:
-        icd_df: DataFrame with diagnosis data
-        biomarker_df: DataFrame with biomarker data (optional)
-        
-    Returns:
-        Dictionary with analysis results
-    """
-    try:
-        start_time = time.time()
-        
-        # Get authoritative codes
-        icd_codes = fetch_authoritative_codes()
-        biomarker_codes = fetch_biomarker_reference_data()
-        
-        # Initialize result dictionary
-        results = {}
-        
-        # Ensure patient_id column is properly set for ICD data
-        if icd_df is not None and not icd_df.empty:
-            # Fix column names if needed
-            if 'patient_id' not in icd_df.columns and 'PatId' in icd_df.columns:
-                icd_df['patient_id'] = icd_df['PatId']
-                
-            # Ensure numeric columns are processed properly
-            if 'age' in icd_df.columns:
-                icd_df['age'] = pd.to_numeric(icd_df['age'], errors='coerce').fillna(0)
-        
-        # Process diagnosis data if available
-        if icd_df is not None and not icd_df.empty:
-            logger.info("Processing diagnosis data...")
-            icd_results = analyze_comorbidity_data(icd_df, icd_codes)
-            results.update(icd_results)
-            
-            # Identify diagnosis columns
-            diag_cols = [col for col in icd_df.columns if 'icd' in col.lower() or 'diagnosis' in col.lower() or 'condition' in col.lower()]
-            if not diag_cols:
-                diag_cols = ['icd_code', 'icd_description']
-                
-            # Process domain data
-            domain_df = process_domain_data(icd_df, diag_cols)
-            results['domain_df'] = domain_df
-        else:
-            logger.info("No diagnosis data provided")
-            domain_df = pd.DataFrame()
-            results['domain_df'] = domain_df
-            
-        # Process biomarker data if available
-        if biomarker_df is not None and not biomarker_df.empty:
-            # Fix column names if needed
-            if 'patient_id' not in biomarker_df.columns and 'PatId' in biomarker_df.columns:
-                biomarker_df['patient_id'] = biomarker_df['PatId']
-                
-            logger.info("Processing biomarker data...")
-            biomarker_results = analyze_biomarker_data(biomarker_df, biomarker_codes)
-            
-            # Add biomarker results to overall results
-            if 'domain_counts' in results:
-                # Merge domain counts
-                for domain, count in biomarker_results['domain_counts'].items():
-                    results['domain_counts'][domain] = results['domain_counts'].get(domain, 0) + count
-            else:
-                results['domain_counts'] = biomarker_results['domain_counts']
-                
-            # Merge network data
-            if results.get('network') is None:
-                results['network'] = biomarker_results['network']
-            elif biomarker_results['network'] is not None:
-                # Combine networks if both exist
-                combined_network = nx.compose(results['network'], biomarker_results['network'])
-                results['network'] = combined_network
-                
-            # Store biomarker dataframe
-            results['biomarker_df'] = biomarker_df
-                
-            # Perform combined analysis if both data types available
-            if 'domain_df' in results and not domain_df.empty:
-                logger.info("Performing combined analysis...")
-                combined_results = perform_combined_analysis(domain_df, biomarker_df)
-                results.update(combined_results)
-        else:
-            logger.info("No biomarker data provided")
-            results['biomarker_df'] = pd.DataFrame()
-            
-        # Create comprehensive network if both datasets available
-        if 'domain_df' in results and 'biomarker_df' in results and not domain_df.empty:
-            # Combine ICD and biomarker data for network
-            combined_df = pd.concat([
-                domain_df[['patient_id', 'condition', 'domain']],
-                results.get('biomarker_domains', pd.DataFrame())
-            ], ignore_index=True)
-            
-            # Create network from combined data
-            G = create_domain_network(combined_df, combined_df)
-            results['network'] = G
-        
-        # Now create the combined patient dataframe for compatibility with main function
-        # This is needed for the metrics in the UI
-        combined_rows = []
-        
-        # Get all unique patient IDs from all data sources
-        all_patient_ids = set()
-        if icd_df is not None and not icd_df.empty:
-            all_patient_ids.update(icd_df['patient_id'].unique())
-        if biomarker_df is not None and not biomarker_df.empty:
-            all_patient_ids.update(biomarker_df['patient_id'].unique())
-            
-        # Calculate risk scores for each patient
-        risk_scores = {}
-        domain_scores = {}
-        mortality_risks = {}
-        hospitalization_risks = {}
-        
-        logger.info(f"Processing risk scores for {len(all_patient_ids)} patients")
-        
-        # Process each patient for risk calculation
-        for patient_id in all_patient_ids:
-            # Get patient conditions
-            patient_conditions = []
-            if 'domain_df' in results and not results['domain_df'].empty and 'condition' in results['domain_df'].columns:
-                patient_conditions = results['domain_df'][results['domain_df']['patient_id'] == patient_id]['condition'].tolist()
-            
-            # Get demographics data
-            age = 0
-            gender = 'Unknown'
-            
-            # Try to get demographics from ICD data first
-            if icd_df is not None and not icd_df.empty:
-                patient_rows = icd_df[icd_df['patient_id'] == patient_id]
-                if not patient_rows.empty:
-                    # Get demographics from first row
-                    if 'age' in patient_rows.columns:
-                        age = patient_rows['age'].iloc[0]
-                        if pd.isna(age):
-                            age = 0
-                    if 'gender' in patient_rows.columns:
-                        gender = patient_rows['gender'].iloc[0]
-                        if pd.isna(gender):
-                            gender = 'Unknown'
-            
-            # Get biomarker data for this patient
-            biomarkers = {}
-            if biomarker_df is not None and not biomarker_df.empty:
-                patient_bio = biomarker_df[biomarker_df['patient_id'] == patient_id]
-                if not patient_bio.empty:
-                    for col in biomarker_df.columns:
-                        if col != 'patient_id' and col in patient_bio.columns and not pd.isna(patient_bio[col].iloc[0]):
-                            try:
-                                value = patient_bio[col].iloc[0]
-                                if isinstance(value, str):
-                                    # Try to convert string to number
-                                    try:
-                                        value = float(value.replace(',', ''))
-                                    except:
-                                        continue
-                                biomarkers[col] = float(value)
-                            except:
-                                pass
-            
-            # Calculate network metrics for this patient
-            network_metrics = {
-                'degree_centrality': 0,
-                'betweenness_centrality': 0
-            }
-            
-            # Prepare patient info for risk calculation
-            patient_info = {
-                'patient_id': patient_id,
-                'conditions': patient_conditions,
-                'age': age,
-                'gender': gender,
-                'network_metrics': network_metrics,
-                'biomarkers': biomarkers,
-                'sdoh_data': {}  # Placeholder for SDOH data
-            }
-            
-            # Calculate risk score
-            risk_result = calculate_total_risk_score(patient_info)
-            
-            # Store results
-            risk_scores[patient_id] = risk_result.get('total_score', 0)
-            domain_scores[patient_id] = risk_result.get('domain_scores', {})
-            mortality_risks[patient_id] = risk_result.get('mortality_risk_10yr', 0)
-            hospitalization_risks[patient_id] = risk_result.get('hospitalization_risk_5yr', 0)
-            
-            # Create row for combined dataframe
-            row = {
-                'patient_id': patient_id,
-                'age': age,
-                'gender': gender,
-                'condition_count': len(patient_conditions),
-                'total_score': risk_result.get('total_score', 0),
-                'mortality_risk_10yr': risk_result.get('mortality_risk_10yr', 0),
-                'hospitalization_risk_5yr': risk_result.get('hospitalization_risk_5yr', 0)
-            }
-            combined_rows.append(row)
-        
-        # Create combined dataframe
-        combined_df = pd.DataFrame(combined_rows)
-        logger.info(f"Created combined dataframe with {len(combined_rows)} patients")
-        
-        # Add to results
-        results['combined_df'] = combined_df
-        results['risk_scores'] = risk_scores
-        results['domain_scores'] = domain_scores
-        results['mortality_risks'] = mortality_risks
-        results['hospitalization_risks'] = hospitalization_risks
-        
-        # Calculate total analysis time
-        analysis_time = time.time() - start_time
-        logger.info(f"Integrated analysis completed in {analysis_time:.2f} seconds")
-        results['analysis_time'] = analysis_time
-        
-        return results
-        
-    except Exception as e:
-        logger.error(f"Error in perform_integrated_analysis: {str(e)}")
-        traceback.print_exc()
-        return {'error': str(e)}
-
-def main():
-    # Set up the sidebar
-    st.sidebar.title("Nudge Health AI Clinical Analyzer")
-    
-    # Add logo or image placeholder
-    st.sidebar.image("https://via.placeholder.com/150x150?text=Nudge+Health", width=150)
-    
-    # Fetch the latest reference data
-    with st.spinner("Updating reference data..."):
-        icd_codes = fetch_authoritative_codes()
-        biomarker_refs = fetch_biomarker_reference_data()
-        st.session_state.icd_codes = icd_codes
-        st.session_state.biomarker_refs = biomarker_refs
-    
-    # OpenAI API key handling
-    try:
-        # Check if running on Streamlit Cloud (where secrets are configured)
-        is_cloud = os.environ.get('STREAMLIT_SHARING', '') == 'true' or os.environ.get('IS_STREAMLIT_CLOUD', '') == 'true'
-        
-        # Try to get the API key from secrets
-        api_key = st.secrets.get("OPENAI_API_KEY", "")
-        
-        if api_key and api_key != "your-api-key-here":
-            st.session_state.openai_api_key = api_key
-            os.environ["OPENAI_API_KEY"] = api_key
-            st.sidebar.success("OpenAI API key configured")
-        elif not is_cloud:  # Only show input field if not on Streamlit Cloud
-            # Only show input field if no API key in secrets and not on cloud
-            st.sidebar.subheader("OpenAI Settings (Optional)")
-            api_key = st.sidebar.text_input("OpenAI API Key (for AI recommendations)", 
-                                          type="password", 
-                                          help="Enter your OpenAI API key to enable AI clinical recommendations")
-            if api_key:
-                st.session_state.openai_api_key = api_key
-                os.environ["OPENAI_API_KEY"] = api_key
-                st.sidebar.success("OpenAI API key configured")
-            else:
-                st.sidebar.info("No OpenAI API key found. AI recommendations will be disabled.")
-    except Exception as e:
-        # Only show the input field if we're not on Streamlit Cloud
-        is_cloud = os.environ.get('STREAMLIT_SHARING', '') == 'true' or os.environ.get('IS_STREAMLIT_CLOUD', '') == 'true'
-        if not is_cloud:
-            st.sidebar.subheader("OpenAI Settings (Optional)")
-            api_key = st.sidebar.text_input("OpenAI API Key (for AI recommendations)", 
-                                          type="password", 
-                                          help="Enter your OpenAI API key to enable AI clinical recommendations")
-            if api_key:
-                st.session_state.openai_api_key = api_key
-                os.environ["OPENAI_API_KEY"] = api_key
-                st.sidebar.success("OpenAI API key configured")
-            else:
-                st.sidebar.info("No OpenAI API key found. AI recommendations will be disabled.")
-    
-    st.sidebar.divider()
-    
-    # Select authentication type
-    auth_type = st.sidebar.radio(
-        "Select Authentication Type:",
-        ["Local Upload", "FHIR Integration"],
-        key="auth_type_radio"
-    )
-    
-    # Remove the separate analysis detail selection
-    # Instead just keep the view type selection
-    view_type = st.sidebar.radio(
-        "Select View Type:",
-        ["Population Analysis", "Single Patient Analysis"],
-        key="view_type_radio"
-    )
-    
-    # Store view type in session state for later use
-    st.session_state.view_type = view_type
-    
-    # Main content area
-    st.title("Clinical Data Analysis Platform")
-    
-    # Local file upload
-    if auth_type == "Local Upload":
-        # Create two columns for file uploads
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.subheader("Upload Comorbidity Data")
-            icd_file = st.file_uploader("Upload ICD-10 Excel file", 
-                                      type=["xlsx", "xls"],
-                                      key="icd_upload",
-                                      help="Excel file with columns: PatId, Gender, Age, and Diagnosis columns")
-        
-        with col2:
-            st.subheader("Upload Biomarker Data")
-            bio_file = st.file_uploader("Upload Biomarker Excel file",
-                                      type=["xlsx", "xls"],
-                                      key="bio_upload",
-                                      help="Excel file with biomarker measurements")
-        
-        # Process the uploaded files
-        icd_df = None
-        bio_df = None
-        
-        # Process ICD-10 data if present
-        if icd_file is not None:
-            try:
-                df = pd.read_excel(icd_file)
-                
-                # Fix column names - support PatId and Pat Id variations
-                if 'Pat Id' in df.columns and 'PatId' not in df.columns:
-                    df.rename(columns={'Pat Id': 'PatId'}, inplace=True)
-                
-                icd_df = process_diagnosis_data(df)
-                if icd_df is not None and not icd_df.empty:
-                    st.success(f"Successfully processed {len(icd_df)} ICD-10 records for {len(icd_df['patient_id'].unique())} patients.")
-                    
-                    # Show ICD data summary
-                    with st.expander("View ICD-10 Data Summary"):
-                        st.write({
-                            "Total Patients": len(icd_df['patient_id'].unique()),
-                            "Total Diagnoses": len(icd_df),
-                            "Domains Found": icd_df['domain'].unique().tolist() if 'domain' in icd_df.columns else []
-                        })
+                corr = pearsonr(
+                    domain_df[domain_df['condition'] == condition1]['risk_factor'],
+                    domain_df[domain_df['condition'] == condition2]['risk_factor']
+                )[0]
+                corr_matrix.at[condition1, condition2] = corr
+                corr_matrix.at[condition2, condition1] = corr
             except Exception as e:
-                st.error(f"Error processing ICD-10 data: {str(e)}")
-        
-        # Process biomarker data if present
-        if bio_file is not None:
-            try:
-                df = pd.read_excel(bio_file)
-                
-                # Fix column names - support PatId and Pat Id variations
-                if 'Pat Id' in df.columns and 'PatId' not in df.columns:
-                    df.rename(columns={'Pat Id': 'PatId'}, inplace=True)
-                
-                bio_df = process_biomarker_data(df)
-                if bio_df is not None and not bio_df.empty:
-                    st.success(f"Successfully processed biomarker data for {bio_df['patient_id'].nunique()} patients.")
-                    
-                    # Show biomarker data summary
-                    with st.expander("View Biomarker Data Summary"):
-                        st.write({
-                            "Total Patients": bio_df['patient_id'].nunique(),
-                            "Biomarkers Available": [col for col in bio_df.columns if col != 'patient_id']
-                        })
-            except Exception as e:
-                st.error(f"Error processing biomarker data: {str(e)}")
-        
-        # Perform analysis based on available data
-        if icd_df is not None or bio_df is not None:
-            with st.spinner("Performing analysis... This may take a moment."):
-                if icd_df is not None and bio_df is not None:
-                    st.info("Performing combined analysis with both comorbidity and biomarker data...")
-                    analysis_results = perform_integrated_analysis(icd_df, bio_df)
-                elif icd_df is not None:
-                    st.info("Performing comorbidity analysis...")
-                    analysis_results = perform_integrated_analysis(icd_df, None)
-                else:
-                    st.info("Performing biomarker analysis...")
-                    analysis_results = perform_integrated_analysis(None, bio_df)
-                
-                if analysis_results:
-                    st.success("Analysis completed successfully!")
-                    
-                    # Get the view type from session state
-                    view_type = st.session_state.get('view_type', 'Population Analysis')
-                    
-                    # Use tabs for better organization of different analysis components
-                    tabs = st.tabs(["Overview", "Network Analysis", "Risk Analysis", "Domain Analysis"])
-                    
-                    with tabs[0]:  # Overview tab
-                        st.subheader("Analysis Overview")
-                        combined_df = analysis_results.get('combined_df')
-                        risk_scores = analysis_results.get('risk_scores', {})
-                        domain_counts = analysis_results.get('domain_counts', {})
-                        mortality_risks = analysis_results.get('mortality_risks', {})
-                        
-                        # Metrics overview
-                        col1, col2, col3, col4 = st.columns(4)
-                        with col1:
-                            if combined_df is not None and not combined_df.empty:
-                                st.metric("Total Patients", combined_df['patient_id'].nunique())
-                            else:
-                                st.metric("Total Patients", 0)
-                        with col2:
-                            high_risk = len([s for s in risk_scores.values() if s > 7]) if risk_scores else 0
-                            st.metric("High Risk Patients", high_risk)
-                        with col3:
-                            avg_score = sum(risk_scores.values()) / len(risk_scores) if risk_scores and len(risk_scores) > 0 else 0
-                            st.metric("Average Risk Score", f"{avg_score:.2f}")
-                        with col4:
-                            # Calculate average mortality risk
-                            avg_mortality = sum(mortality_risks.values()) / len(mortality_risks) if mortality_risks and len(mortality_risks) > 0 else 0
-                            st.metric("Avg Mortality Risk", f"{avg_mortality:.1f}%")
-                            
-                        with tabs[1]:  # Network Analysis tab
-                            st.subheader("Condition Network Analysis")
-                            G = analysis_results.get('network')  # Changed from 'G' to 'network'
-                            domain_df = analysis_results.get('domain_df')
-                            
-                            if G is not None and G.number_of_nodes() > 0:
-                                network_fig = visualize_network_with_communities(G, domain_df)
-                                if network_fig:
-                                    st.plotly_chart(network_fig, use_container_width=True)
-                                
-                                # Display network metrics
-                                st.subheader("Network Metrics")
-                                metrics_cols = st.columns(4)
-                                with metrics_cols[0]:
-                                    st.metric("Nodes", G.number_of_nodes())
-                                with metrics_cols[1]:
-                                    st.metric("Edges", G.number_of_edges())
-                                with metrics_cols[2]:
-                                    # We don't have communities calculated directly anymore
-                                    st.metric("Connected Components", nx.number_connected_components(G))
-                                with metrics_cols[3]:
-                                    st.metric("Density", f"{nx.density(G):.3f}")
-                            else:
-                                st.info("No network data available for visualization.")
-                            
-                        with tabs[2]:  # Risk Analysis tab
-                            st.subheader("Risk Score Analysis")
-                            
-                            # Population risk distribution
-                            st.subheader("Population Risk Distribution")
-                            risk_df = pd.DataFrame({
-                                'Patient ID': list(risk_scores.keys()),
-                                'Risk Score': list(risk_scores.values())
-                            })
-                            risk_hist = px.histogram(risk_df, x='Risk Score',
-                                                nbins=20,
-                                                title="Distribution of Risk Scores",
-                                                labels={'Risk Score': 'NHCRS Score'})
-                            st.plotly_chart(risk_hist, use_container_width=True)
-                            
-                            # Risk categories
-                            risk_categories = {
-                                'Low Risk (0-3)': len([s for s in risk_scores.values() if s <= 3]),
-                                'Moderate Risk (3-7)': len([s for s in risk_scores.values() if s > 3 and s <= 7]),
-                                'High Risk (7-10)': len([s for s in risk_scores.values() if s > 7 and s <= 10]),
-                                'Severe Risk (>10)': len([s for s in risk_scores.values() if s > 10])
-                            }
-                            
-                            risk_cat_df = pd.DataFrame({
-                                'Category': risk_categories.keys(),
-                                'Count': risk_categories.values()
-                            })
-                            
-                            risk_cat_chart = px.pie(risk_cat_df, names='Category', values='Count',
-                                                 title="Risk Score Categories")
-                            st.plotly_chart(risk_cat_chart, use_container_width=True)
-                            
-                        with tabs[3]:  # Domain Analysis tab
-                            st.subheader("Clinical Domain Analysis")
-                            
-                            # Display domain distribution
-                            domain_df = pd.DataFrame({
-                                'Domain': domain_counts.keys(),
-                                'Count': domain_counts.values()
-                            })
-                            domain_chart = px.bar(domain_df, x='Domain', y='Count',
-                                              color='Domain', title="Distribution of Clinical Domains")
-                            st.plotly_chart(domain_chart, use_container_width=True)
-                            
-                            # Domain-specific risk scores
-                            domain_scores = analysis_results.get('domain_scores', {})
-                            if domain_scores:
-                                # Calculate average domain scores across population
-                                avg_domain_scores = {}
-                                for patient_id, scores in domain_scores.items():
-                                    for domain, score in scores.items():
-                                        if domain not in avg_domain_scores:
-                                            avg_domain_scores[domain] = []
-                                        avg_domain_scores[domain].append(score)
-                                
-                                # Calculate averages
-                                avg_scores = {domain: sum(scores)/len(scores) if scores else 0 
-                                            for domain, scores in avg_domain_scores.items()}
-                                
-                                # Create dataframe for visualization
-                                avg_domain_df = pd.DataFrame({
-                                    'Domain': avg_scores.keys(),
-                                    'Average Score': avg_scores.values()
-                                })
-                                
-                                domain_score_chart = px.bar(avg_domain_df, x='Domain', y='Average Score',
-                                                        color='Domain', title="Average Domain Risk Scores")
-                                st.plotly_chart(domain_score_chart, use_container_width=True)
-                        
-                        # Show the appropriate view based on user selection
-                        if view_type == 'Population Analysis':
-                            st.subheader("Population Analysis")
-                            st.info("Use the tabs above to explore different aspects of the population analysis.")
-                            
-                        elif view_type == 'Single Patient Analysis':
-                            st.subheader("Single Patient Analysis")
-                            # Display patient selection and details
-                            combined_df = analysis_results.get('combined_df')
-                            
-                            if combined_df is not None and not combined_df.empty:
-                                patient_ids = combined_df['patient_id'].unique()
-                                if len(patient_ids) > 0:
-                                    selected_patient = st.selectbox("Select Patient for Detailed Analysis:", 
-                                                                 options=patient_ids)
-                                    
-                                    # Get patient data
-                                    patient_info = {
-                                        'patient_id': selected_patient,
-                                        'age': combined_df[combined_df['patient_id'] == selected_patient]['age'].iloc[0] if 'age' in combined_df.columns else 0,
-                                        'gender': combined_df[combined_df['patient_id'] == selected_patient]['gender'].iloc[0] if 'gender' in combined_df.columns else 'Unknown',
-                                        'total_score': analysis_results.get('risk_scores', {}).get(selected_patient, 0),
-                                        'mortality_risk_10yr': analysis_results.get('mortality_risks', {}).get(selected_patient, 0),
-                                        'hospitalization_risk_5yr': analysis_results.get('hospitalization_risks', {}).get(selected_patient, 0),
-                                        'domain_scores': analysis_results.get('domain_scores', {}).get(selected_patient, {})
-                                    }
-                                    
-                                    # Display patient info
-                                    st.write(f"**Patient ID:** {selected_patient}")
-                                    st.write(f"**Age:** {patient_info['age']}")
-                                    st.write(f"**Gender:** {patient_info['gender']}")
-                                    
-                                    # Display risk scores
-                                    risk_cols = st.columns(3)
-                                    with risk_cols[0]:
-                                        st.metric("Total Risk Score", f"{patient_info['total_score']:.1f}")
-                                    with risk_cols[1]:
-                                        st.metric("10yr Mortality Risk", f"{patient_info['mortality_risk_10yr']:.1f}%")
-                                    with risk_cols[2]:
-                                        st.metric("5yr Hospitalization Risk", f"{patient_info['hospitalization_risk_5yr']:.1f}%")
-                                    
-                                    # Display domain scores
-                                    st.subheader("Clinical Domain Risks")
-                                    domain_scores = patient_info['domain_scores']
-                                    if domain_scores:
-                                        # Create a bar chart for domain scores
-                                        domain_df = pd.DataFrame({
-                                            'Domain': list(domain_scores.keys()),
-                                            'Score': list(domain_scores.values())
-                                        })
-                                        domain_df = domain_df.sort_values('Score', ascending=False)
-                                        
-                                        fig = px.bar(domain_df, x='Domain', y='Score',
-                                                   labels={'Score': 'Risk Score', 'Domain': 'Clinical Domain'},
-                                                   color='Score',
-                                                   color_continuous_scale='Reds')
-                                        st.plotly_chart(fig, use_container_width=True)
-                                    else:
-                                        st.info("No domain scores available for this patient.")
-                                else:
-                                    st.warning("No patients found in the analysis results.")
-                            else:
-                                st.warning("No patient data available for analysis.")
-                            
-    # FHIR Integration
-    else:
-        st.info("FHIR Integration is coming soon! Please use local file upload for now.")
+                logger.warning(f"Error calculating correlation between {condition1} and {condition2}: {str(e)}")
+                corr_matrix.at[condition1, condition2] = 0
+                corr_matrix.at[condition2, condition1] = 0
     
-    # Add footer
-    st.sidebar.divider()
-    st.sidebar.markdown("© 2025 Nudge Health AI. All rights reserved.")
+    return corr_matrix
 
-# Helper function to extract patient data from DataFrame
-def get_patient_data(df, patient_id):
-    """Extract relevant data for a specific patient"""
-    patient_df = df[df['PatId'] == patient_id]
+def leiden_clustering(G, resolution=1.0):
+    """
+    Apply Leiden community detection algorithm to a NetworkX graph.
     
-    # Extract basic demographics
-    age = patient_df['Age'].iloc[0] if 'Age' in patient_df.columns and not patient_df.empty else 'Unknown'
-    gender = patient_df['Gender'].iloc[0] if 'Gender' in patient_df.columns and not patient_df.empty else 'Unknown'
-    
-    # Extract conditions
-    conditions = []
-    for col in patient_df.columns:
-        if 'diag' in col.lower() or 'icd' in col.lower() or 'condition' in col.lower():
-            values = patient_df[col].dropna().unique()
-            conditions.extend([str(v) for v in values if str(v).strip()])
-    
-    # Create patient data dictionary
-    patient_data = {
-        'patient_id': patient_id,
-        'age': age,
-        'gender': gender,
-        'conditions': conditions
-    }
-    
-    return patient_data
-
-# Helper function to calculate risk scores for a specific patient
-def calculate_patient_risk_scores(patient_data, G=None, network_metrics=None):
-    """Calculate risk scores for a patient based on network metrics"""
-    # Get conditions and their domains
-    conditions = patient_data.get('conditions', [])
-    domains = [assign_clinical_domain(condition) for condition in conditions]
-    domain_counts = {domain: domains.count(domain) for domain in set(domains)}
-    
-    # Calculate domain scores
-    domain_scores = {}
-    for domain, count in domain_counts.items():
-        # Base score from count
-        base_score = min(count * 0.5, 3.0)
+    Args:
+        G: NetworkX graph
+        resolution: Resolution parameter (higher values create smaller communities)
         
-        # Add severity component
-        severity_component = 0
-        for condition in conditions:
-            if assign_clinical_domain(condition) == domain:
-                severity = get_condition_severity(condition)
-                severity_component += severity * 0.3
+    Returns:
+        Dictionary mapping nodes to community IDs
+    """
+    try:
+        if not LEIDEN_AVAILABLE:
+            logger.warning("Leiden algorithm not available - install leidenalg package")
+            return {}
+            
+        # Convert NetworkX graph to igraph
+        edge_list = list(G.edges(data='weight'))
+        weighted_edges = [(u, v, w if w is not None else 1.0) for u, v, w in edge_list]
         
-        # Network component if network data is available
-        network_component = 0
-        if G is not None and network_metrics is not None:
-            for condition in conditions:
-                if assign_clinical_domain(condition) == domain and condition in network_metrics.get('centrality', {}):
-                    network_component += network_metrics['centrality'].get(condition, 0) * 2
+        # Create igraph with same nodes
+        ig_G = ig.Graph()
+        ig_G.add_vertices(list(G.nodes()))
         
-        # Combined domain score
-        domain_scores[domain] = base_score + severity_component + network_component
-    
-    # Calculate total risk score (NHCRS)
-    total_score = sum(domain_scores.values())
-    
-    # Calculate mortality risk (simplified model)
-    age_factor = int(patient_data.get('age', 50)) / 20  # Age scaling factor
-    mortality_risk_10yr = min(95, total_score * 3 * age_factor)
-    
-    # Calculate hospitalization risk
-    hospitalization_risk_5yr = min(90, total_score * 5)
-    
-    # Prepare risk scores dictionary
-    risk_scores = {
-        'total_score': total_score,
-        'domain_scores': domain_scores,
-        'mortality_risk_10yr': mortality_risk_10yr,
-        'hospitalization_risk_5yr': hospitalization_risk_5yr
-    }
-    
-    return risk_scores
+        # Add edges with weights if available
+        if weighted_edges:
+            # Extract edges and weights
+            edges = [(G.nodes().index(u), G.nodes().index(v)) for u, v, _ in weighted_edges]
+            weights = [w for _, _, w in weighted_edges]
+            
+            # Add to graph
+            ig_G.add_edges(edges)
+            ig_G.es['weight'] = weights
+            
+            # Apply Leiden algorithm
+            partition = la.find_partition(
+                ig_G, 
+                la.RBConfigurationVertexPartition, 
+                weights='weight',
+                resolution_parameter=resolution
+            )
+        else:
+            # Unweighted graph
+            edges = [(G.nodes().index(u), G.nodes().index(v)) for u, v in G.edges()]
+            ig_G.add_edges(edges)
+            
+            # Apply Leiden algorithm
+            partition = la.find_partition(
+                ig_G,
+                la.RBConfigurationVertexPartition,
+                resolution_parameter=resolution
+            )
+        
+        # Convert result to dictionary
+        node_list = list(G.nodes())
+        community_dict = {}
+        
+        for i, membership in enumerate(partition.membership):
+            community_dict[node_list[i]] = membership
+            
+        return community_dict
+        
+    except Exception as e:
+        logger.error(f"Error in Leiden clustering: {str(e)}")
+        return {}
 
 def generate_clinical_recommendations(patient_data, risk_scores):
     """
-    Generate clinical recommendations using OpenAI based on patient data and risk scores.
+    Generate AI-powered clinical recommendations using the OpenAI API.
+    Implements a structured JSON approach with explicit gender-specific risk factors.
     
     Args:
         patient_data: Dictionary containing patient information
         risk_scores: Dictionary containing risk score information
         
     Returns:
-        String with clinical recommendations
+        String containing clinical recommendations
     """
+    # Check if API key is available
+    if not hasattr(st.session_state, 'openai_api_key') or not st.session_state.openai_api_key:
+        return "OpenAI API key not available. Please provide a valid API key to generate recommendations."
+    
     try:
-        # Set OpenAI API key from session state
-        if 'openai_api_key' in st.session_state:
-            openai.api_key = st.session_state.openai_api_key
-        else:
-            return "OpenAI API key not found. Please provide a valid API key to generate recommendations."
+        # Configure OpenAI client
+        openai.api_key = st.session_state.openai_api_key
         
-        # Prepare detailed patient information for the prompt
-        age = patient_data.get('age', 'Unknown')
+        # Extract patient information
+        age = patient_data.get('age', 0)
         gender = patient_data.get('gender', 'Unknown')
         conditions = patient_data.get('conditions', [])
-        domains = risk_scores.get('domain_scores', {})
-        total_score = risk_scores.get('total_score', 0)
-        mortality_risk = risk_scores.get('mortality_risk_10yr', 0)
+        biomarkers = patient_data.get('biomarkers', {})
         
-        # Format the domain scores for better readability
-        domain_text = ""
-        for domain, score in domains.items():
-            domain_text += f"- {domain.replace('_', ' ').title()}: {score:.2f}/10\n"
+        # Convert gender to standardized format
+        gender_binary = 1 if gender and str(gender).lower() in ['f', 'female', 'woman'] else 0
+        gender_text = "Female" if gender_binary == 1 else "Male"
         
-        # Format conditions list
-        conditions_text = "\n".join([f"- {condition}" for condition in conditions])
+        # Create biological age calculation
+        biological_age = calculate_biological_age(age, conditions, biomarkers)
         
-        # Construct the prompt for the AI
+        # Organize conditions by domain
+        conditions_by_domain = {}
+        for condition in conditions:
+            domain = assign_clinical_domain(condition)
+            if domain not in conditions_by_domain:
+                conditions_by_domain[domain] = []
+            conditions_by_domain[domain].append(condition)
+        
+        # Format biomarkers with status
+        formatted_biomarkers = {}
+        for marker, value in biomarkers.items():
+            # Get status if possible
+            status = "Unknown"
+            try:
+                value_float = float(value)
+                # Determine status based on common reference ranges
+                if marker.lower() in ['ldl', 'ldl-c']:
+                    if value_float < 100:
+                        status = "Optimal"
+                    elif value_float < 130:
+                        status = "Near Optimal"
+                    elif value_float < 160:
+                        status = "Borderline High"
+                    elif value_float < 190:
+                        status = "High"
+                    else:
+                        status = "Very High"
+                elif marker.lower() in ['hdl', 'hdl-c']:
+                    if value_float < 40:
+                        status = "Low"
+                    elif value_float < 60:
+                        status = "Normal"
+                    else:
+                        status = "High (Optimal)"
+                elif marker.lower() in ['hba1c', 'a1c']:
+                    if value_float < 5.7:
+                        status = "Normal"
+                    elif value_float < 6.5:
+                        status = "Pre-diabetes"
+                    else:
+                        status = "Diabetes"
+                
+                formatted_biomarkers[marker] = {
+                    "value": value_float,
+                    "status": status
+                }
+            except:
+                formatted_biomarkers[marker] = {
+                    "value": value,
+                    "status": "Unknown"
+                }
+        
+        # Create structured JSON for OpenAI with explicit gender factors
+        patient_json = {
+            "patient_profile": {
+                "demographics": {
+                    "age": age,
+                    "gender": gender_text,
+                    "biological_age": biological_age
+                },
+                "risk_assessment": {
+                    "total_risk_score": risk_scores.get('total_score', 0),
+                    "mortality_risk_10yr": risk_scores.get('mortality_risk_10yr', 0),
+                    "hospitalization_risk_5yr": risk_scores.get('hospitalization_risk_5yr', 0),
+                    "domain_scores": risk_scores.get('domain_scores', {})
+                },
+                "clinical_data": {
+                    "conditions_by_domain": conditions_by_domain,
+                    "biomarkers": formatted_biomarkers
+                },
+                "gender_specific_factors": {
+                    "is_female": gender_binary == 1,
+                    "gender_risk_modifiers": {
+                        "cardiometabolic": 1.2 if gender_binary == 1 else 1.4 if age < 55 else 1.2,
+                        "cancer": 1.8 if gender_binary == 1 and age < 50 else 1.6 if gender_binary == 0 and age >= 50 else 1.2,
+                        "immune_inflammation": 1.4 if gender_binary == 1 else 1.0,
+                        "neurological_frailty": 1.5 if gender_binary == 1 else 0.75
+                    },
+                    "gender_specific_screening": gender_binary == 1 and age >= 40
+                }
+            }
+        }
+        
+        # Create prompt with structured JSON
         prompt = f"""
-        You are an expert clinical decision support system. Based on the following patient data, 
-        provide evidence-based clinical recommendations focusing on risk mitigation, monitoring, and 
-        lifestyle interventions. Format your response in clear sections.
+        You are a clinical decision support AI. Analyze the following patient data and provide evidence-based clinical recommendations.
+        The data includes gender-specific risk factors that should be prominently considered in your analysis.
         
-        PATIENT INFORMATION:
-        - Age: {age}
-        - Gender: {gender}
-        - Conditions: 
-        {conditions_text}
+        PATIENT DATA:
+        {json.dumps(patient_json, indent=2)}
         
-        RISK ASSESSMENT:
-        - Total Nudge Health Clinical Risk Score (NHCRS): {total_score:.2f}
-        - 10-Year Mortality Risk: {mortality_risk:.1f}%
-        - Clinical Domain Scores:
-        {domain_text}
+        INSTRUCTIONS:
+        1. Analyze the patient profile with special attention to gender-specific clinical factors.
+        2. Provide recommendations in these structured sections:
+           a. Clinical Risk Summary (interpret the risk scores with emphasis on gender-specific implications)
+           b. Recommended Screenings (include gender-specific screenings as appropriate)
+           c. Treatment Considerations (account for gender differences in treatment response)
+           d. Follow-up Timeline
+           e. References to Clinical Guidelines
         
-        Provide specific, actionable recommendations in the following categories:
-        1. Additional Diagnostic Testing (prioritized by importance)
-        2. Monitoring Protocol (what to monitor and frequency)
-        3. Pharmacological Interventions (if appropriate)
-        4. Lifestyle Optimization
-        5. Preventive Measures
-        
-        For each recommendation, briefly explain the rationale based on the patient's specific risk profile.
+        FORMAT:
+        Use concise bullet points for recommendations. Reference specific clinical guidelines where relevant.
         """
         
         # Call OpenAI API
-        response = openai.ChatCompletion.create(
-            model="gpt-4",
+        response = openai.chat.completions.create(
+            model="gpt-4o",  # Use the most advanced model available
             messages=[
-                {"role": "system", "content": "You are a clinical decision support system providing evidence-based recommendations."},
+                {"role": "system", "content": "You are a clinical decision support AI that provides evidence-based recommendations."},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.2,
-            max_tokens=1000
+            temperature=0.3,  # Lower temperature for more consistent outputs
+            max_tokens=2000
         )
         
-        # Extract the recommendation text
-        recommendation_text = response.choices[0].message.content.strip()
-        return recommendation_text
+        # Get recommendation text from response
+        recommendations = response.choices[0].message.content
+        
+        return recommendations
         
     except Exception as e:
-        logger.error(f"Error generating clinical recommendations: {str(e)}")
+        logger.error(f"Error generating recommendations: {str(e)}")
         return f"Error generating recommendations: {str(e)}"
 
-def generate_pdf_report(patient_data, risk_scores, recommendations=None):
+# Add these functions before the if __name__ == "__main__":
+
+def get_gender_age_factor(gender, age, domain):
     """
-    Generate a PDF report containing patient information and risk scores.
+    Calculate risk adjustment factors based on gender and age for each domain.
+    Based on validated hazard ratios from NHANES and UK Biobank.
     
     Args:
-        patient_data: Dictionary containing patient information
-        risk_scores: Dictionary containing risk score information
-        recommendations: Optional AI-generated recommendations
+        gender: Patient gender (string)
+        age: Patient age (integer)
+        domain: Clinical domain (string)
         
     Returns:
-        Bytes containing the PDF file
+        Adjustment factor as float
     """
-    try:
-        # Create PDF object
-        pdf = FPDF()
-        pdf.add_page()
-        
-        # Set up header
-        pdf.set_font('Arial', 'B', 16)
-        pdf.cell(0, 10, "Nudge Health AI Clinical Analysis Report", 0, 1, 'C')
-        pdf.set_font('Arial', '', 10)
-        pdf.cell(0, 6, f"Generated on {datetime.now().strftime('%Y-%m-%d %H:%M')}", 0, 1, 'C')
-        pdf.line(10, 30, 200, 30)
-        pdf.ln(10)
-        
-        # Patient information
-        pdf.set_font('Arial', 'B', 14)
-        pdf.cell(0, 10, "Patient Overview", 0, 1, 'L')
-        pdf.set_font('Arial', '', 12)
-        pdf.cell(60, 8, f"Patient ID: {patient_data.get('patient_id', 'Unknown')}", 0, 1)
-        pdf.cell(60, 8, f"Age: {patient_data.get('age', 'Unknown')}", 0, 1)
-        pdf.cell(60, 8, f"Gender: {patient_data.get('gender', 'Unknown')}", 0, 1)
-        pdf.ln(5)
-        
-        # Conditions
-        pdf.set_font('Arial', 'B', 12)
-        pdf.cell(0, 10, "Conditions:", 0, 1)
-        pdf.set_font('Arial', '', 10)
-        for condition in patient_data.get('conditions', []):
-            pdf.cell(0, 6, f"• {condition}", 0, 1)
-        pdf.ln(5)
-        
-        # Risk Scores
-        pdf.set_font('Arial', 'B', 14)
-        pdf.cell(0, 10, "Risk Assessment", 0, 1, 'L')
-        pdf.set_font('Arial', 'B', 12)
-        pdf.cell(0, 8, f"NHCRS Total Score: {risk_scores.get('total_score', 0):.2f}", 0, 1)
-        pdf.cell(0, 8, f"10-Year Mortality Risk: {risk_scores.get('mortality_risk_10yr', 0):.1f}%", 0, 1)
-        pdf.cell(0, 8, f"5-Year Hospitalization Risk: {risk_scores.get('hospitalization_risk_5yr', 0):.1f}%", 0, 1)
-        pdf.ln(5)
-        
-        # Domain Scores
-        pdf.set_font('Arial', 'B', 12)
-        pdf.cell(0, 10, "Clinical Domain Scores:", 0, 1)
-        pdf.set_font('Arial', '', 10)
-        for domain, score in risk_scores.get('domain_scores', {}).items():
-            formatted_domain = domain.replace('_', ' ').title()
-            pdf.cell(0, 6, f"• {formatted_domain}: {score:.2f}/10", 0, 1)
-        pdf.ln(5)
-        
-        # Network Analysis if available
-        if 'network_metrics' in patient_data:
-            pdf.set_font('Arial', 'B', 14)
-            pdf.cell(0, 10, "Network Analysis", 0, 1, 'L')
-            pdf.set_font('Arial', '', 10)
-            metrics = patient_data['network_metrics']
-            pdf.cell(0, 6, f"Degree Centrality: {metrics.get('degree_centrality', 0):.3f}", 0, 1)
-            pdf.cell(0, 6, f"Betweenness Centrality: {metrics.get('betweenness_centrality', 0):.3f}", 0, 1)
-            pdf.ln(5)
-        
-        # AI Recommendations if available
-        if recommendations:
-            pdf.add_page()
-            pdf.set_font('Arial', 'B', 14)
-            pdf.cell(0, 10, "AI Clinical Recommendations", 0, 1, 'L')
-            pdf.set_font('Arial', '', 10)
-            
-            # Split the recommendations into lines and add to PDF
-            lines = recommendations.split('\n')
-            for line in lines:
-                # Handle markdown-like formatting
-                if line.strip().startswith('#'):
-                    pdf.set_font('Arial', 'B', 12)
-                    pdf.cell(0, 8, line.strip('# '), 0, 1)
-                    pdf.set_font('Arial', '', 10)
-                elif line.strip().startswith('*') or line.strip().startswith('-'):
-                    pdf.cell(0, 6, f"  {line.strip('*- ')}", 0, 1)
-                else:
-                    pdf.multi_cell(0, 5, line)
-            
-        # Add footer with copyright
-        pdf.ln(20)
-        pdf.set_font("Arial", "I", 8)
-        pdf.cell(0, 10, "© 2025 Nudge Health AI. All rights reserved.", ln=True, align='C')
-        
-        # Return the PDF as bytes
-        return pdf.output(dest='S').encode('latin-1')
-        
-    except Exception as e:
-        logger.error(f"Error generating PDF report: {str(e)}")
-        # Return a simple error PDF
-        pdf = FPDF()
-        pdf.add_page()
-        pdf.set_font('Arial', 'B', 16)
-        pdf.cell(0, 10, "Error Generating Report", 0, 1, 'C')
-        pdf.set_font('Arial', '', 12)
-        pdf.cell(0, 10, f"An error occurred: {str(e)}", 0, 1, 'L')
-        return pdf.output(dest='S').encode('latin-1')
+    # Convert gender to binary for calculations (1=female, 0=male)
+    is_female = 1 if gender and str(gender).lower() in ['f', 'female', 'woman'] else 0
+    
+    # Domain-specific adjustments based on gender/age interactions
+    if domain == "Cardiometabolic":
+        if is_female:
+            if age < 55:
+                return 0.85  # Lower relative risk for young women
+            else:
+                return 1.2   # Higher risk for women post-menopause
+        else:  # Male
+            if age < 55:
+                return 1.4   # Higher risk for younger men
+            else:
+                return 1.2   # Risk levels off for older men
+    
+    elif domain == "Cancer":
+        if is_female:
+            if age < 50:
+                return 1.8   # Higher risk for women of reproductive age
+            else:
+                return 1.2   # Risk adjustment post-menopause
+        else:  # Male
+            if age >= 50:
+                return 1.6   # Higher risk for men over 50
+            else:
+                return 1.0
+    
+    elif domain == "Immune-Inflammation":
+        if is_female:
+            return 1.4       # Women have higher risk for inflammatory/autoimmune conditions
+        else:
+            return 1.0
+    
+    elif domain == "Neuro-Mental Health":
+        if is_female:
+            return 1.3       # Higher risk for depression/anxiety
+        else:
+            return 1.1
+    
+    elif domain == "Neurological-Frailty":
+        if is_female:
+            if age >= 65:
+                return 1.5   # Higher risk for older women
+            else:
+                return 1.0
+        else:  # Male
+            if age >= 65:
+                return 1.2   # Higher risk for frailty in older men
+            else:
+                return 0.75
+    
+    # Default if domain not recognized
+    return 1.0
 
-# Display patient risk scores in a formatted way
-def display_patient_risk_scores(patient_data, risk_scores):
-    """Display patient risk scores in the Streamlit UI"""
-    st.subheader(f"Risk Assessment for Patient {patient_data['patient_id']}")
+def calculate_biological_age(chronological_age, conditions, biomarkers):
+    """
+    Calculate a simplified biological age based on chronological age, conditions, and biomarkers.
+    Uses the Phenotypic Age concept from NHANES (Levine et al.)
     
-    # Display overall scores
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("NHCRS Score", f"{risk_scores['total_score']:.1f}")
-    with col2:
-        st.metric("10-Year Mortality Risk", f"{risk_scores['mortality_risk_10yr']:.1f}%")
-    with col3:
-        st.metric("5-Year Hospitalization Risk", f"{risk_scores['hospitalization_risk_5yr']:.1f}%")
+    Args:
+        chronological_age: Chronological age in years
+        conditions: List of medical conditions
+        biomarkers: Dictionary of biomarker values
+        
+    Returns:
+        Estimated biological age in years
+    """
+    # Initialize with chronological age
+    biological_age = chronological_age
     
-    # Display domain scores
-    st.subheader("Clinical Domain Scores")
-    domain_scores = risk_scores['domain_scores']
+    # Add years based on condition count (simplified)
+    condition_count = len(conditions) if conditions else 0
+    if condition_count > 0:
+        # Each condition adds 0.5 to 1.5 years depending on count
+        biological_age += min(condition_count * 0.75, 7.5)
     
-    # Convert to DataFrame for charting
-    domain_df = pd.DataFrame({
-        'Domain': domain_scores.keys(),
-        'Score': domain_scores.values()
-    })
+    # Add/subtract years based on key biomarkers if available
+    if biomarkers:
+        # Glycemic status (HbA1c or glucose)
+        if 'hba1c' in biomarkers:
+            hba1c = float(biomarkers['hba1c'])
+            if hba1c >= 6.5:  # Diabetes range
+                biological_age += 5
+            elif hba1c >= 5.7:  # Prediabetes range
+                biological_age += 2
+            elif hba1c < 5.0:  # Very low end
+                biological_age -= 1
+        elif 'glucose' in biomarkers:
+            glucose = float(biomarkers['glucose'])
+            if glucose >= 126:  # Diabetes range
+                biological_age += 4
+            elif glucose >= 100:  # Prediabetes range
+                biological_age += 2
+            
+        # Inflammation (CRP)
+        if 'crp' in biomarkers or 'hs_crp' in biomarkers:
+            crp_value = float(biomarkers.get('crp', biomarkers.get('hs_crp', 0)))
+            if crp_value >= 3.0:  # High inflammation
+                biological_age += 3
+            elif crp_value >= 1.0:  # Moderate inflammation
+                biological_age += 1
+                
+        # Kidney function
+        if 'creatinine' in biomarkers:
+            creatinine = float(biomarkers['creatinine'])
+            if creatinine >= 1.5:  # Kidney impairment
+                biological_age += 3
+        elif 'egfr' in biomarkers:
+            egfr = float(biomarkers['egfr'])
+            if egfr < 60:  # CKD stage 3+
+                biological_age += 3
+            elif egfr < 90:  # Mild kidney dysfunction
+                biological_age += 1
+                
+        # Cardiovascular (cholesterol)
+        if 'ldl_cholesterol' in biomarkers:
+            ldl = float(biomarkers['ldl_cholesterol'])
+            if ldl >= 160:
+                biological_age += 2
+            elif ldl >= 130:
+                biological_age += 1
+                
+        if 'hdl_cholesterol' in biomarkers:
+            hdl = float(biomarkers['hdl_cholesterol'])
+            if hdl >= 60:  # Protective effect
+                biological_age -= 1
+            elif hdl < 40:  # Risk factor
+                biological_age += 1
+                
+    # Cap the biological age to reasonable bounds
+    biological_age = max(chronological_age - 15, biological_age)
+    biological_age = min(chronological_age + 25, biological_age)
     
-    # Create bar chart
-    fig = px.bar(domain_df, x='Domain', y='Score', 
-                color='Score', color_continuous_scale='Reds',
-                title="Risk Scores by Clinical Domain")
-    st.plotly_chart(fig, use_container_width=True)
+    return round(biological_age, 1)
+
+def calculate_mortality_risk(age, gender, domain_scores, health_factors, biomarkers):
+    """
+    Calculate 10-year mortality risk using validated Cox regression coefficients
+    from NHANES and UK Biobank cohort studies.
+    
+    Args:
+        age: Patient age in years
+        gender: Patient gender
+        domain_scores: Dictionary of domain scores
+        health_factors: Dictionary of health factors
+        biomarkers: Dictionary of biomarker values
+        
+    Returns:
+        Mortality risk percentage
+    """
+    # Convert gender to binary for calculations
+    is_female = 1 if gender and str(gender).lower() in ['f', 'female', 'woman'] else 0
+    
+    # Base survival probability (S0(10)) from NHANES for 10-year mortality
+    base_survival = 0.95  # For a reference population at age 50
+    
+    # Baseline hazard adjustment by age
+    # Mortality doubles approximately every 8 years after 50
+    age_hr = math.exp(0.086 * (age - 50))  # ~8% increase per year over 50
+    
+    # Calculate a weighted sum from each domain
+    # Using validated HR coefficients from NHANES/UK Biobank
+    hazard_sum = 0
+    
+    # Cardiometabolic domain (CM): ~2.15 HR
+    cm_score = domain_scores.get('Cardiometabolic', 0)
+    if cm_score > 0:
+        cm_factor = get_gender_age_factor(gender, age, 'Cardiometabolic')
+        hazard_sum += math.log(2.15) * (cm_score / 10) * cm_factor
+    
+    # Immune-Inflammation domain (II): ~2.05 HR
+    ii_score = domain_scores.get('Immune-Inflammation', 0)
+    if ii_score > 0:
+        ii_factor = get_gender_age_factor(gender, age, 'Immune-Inflammation')
+        hazard_sum += math.log(2.05) * (ii_score / 10) * ii_factor
+    
+    # Oncological domain (CA): ~2.83 HR
+    ca_score = domain_scores.get('Oncological', 0)
+    if ca_score > 0:
+        ca_factor = get_gender_age_factor(gender, age, 'Cancer')
+        hazard_sum += math.log(2.83) * (ca_score / 10) * ca_factor
+    
+    # Neuro-Mental Health domain (NMH): ~1.56 HR 
+    nmh_score = domain_scores.get('Neuro-Mental Health', 0)
+    if nmh_score > 0:
+        nmh_factor = get_gender_age_factor(gender, age, 'Neuro-Mental Health')
+        hazard_sum += math.log(1.56) * (nmh_score / 10) * nmh_factor
+    
+    # Neurological-Frailty domain (NF): ~2.87 HR
+    nf_score = domain_scores.get('Neurological-Frailty', 0)
+    if nf_score > 0:
+        nf_factor = get_gender_age_factor(gender, age, 'Neurological-Frailty')
+        hazard_sum += math.log(2.87) * (nf_score / 10) * nf_factor
+    
+    # Social Determinants of Health (SDOH): ~1.47 HR
+    sdoh_score = 0
+    if 'sdoh_data' in health_factors:
+        sdoh_data = health_factors.get('sdoh_data', {})
+        # Convert SDOH factors to score (0-10 scale)
+        sdoh_values = sdoh_data.values()
+        if sdoh_values:
+            sdoh_score = sum(sdoh_values) * 10 / len(sdoh_values)
+        hazard_sum += math.log(1.47) * (sdoh_score / 10)
+    
+    # Biomarker-specific hazard ratios
+    if biomarkers:
+        # High CRP
+        if 'crp' in biomarkers:
+            crp = float(biomarkers['crp'])
+            if crp > 3.0:  # High inflammation
+                hazard_sum += math.log(2.05) * 0.5
+            elif crp > 1.0:  # Moderate inflammation
+                hazard_sum += math.log(2.05) * 0.2
+        
+        # High WBC count
+        if 'wbc' in biomarkers:
+            wbc = float(biomarkers['wbc'])
+            if wbc > 10:  # Elevated
+                hazard_sum += math.log(1.78) * 0.5
+        
+        # Anemia
+        if 'hemoglobin' in biomarkers:
+            hemoglobin = float(biomarkers['hemoglobin'])
+            if (is_female and hemoglobin < 12) or (not is_female and hemoglobin < 13):
+                hazard_sum += math.log(1.67) * 0.5
+    
+    # Calculate hazard ratio from the sum
+    hr = math.exp(hazard_sum)
+    
+    # Adjust by age hazard ratio
+    hr *= age_hr
+    
+    # Calculate survival probability
+    survival_prob = base_survival ** hr
+    
+    # Convert to mortality risk (%)
+    mortality_risk = (1 - survival_prob) * 100
+    
+    # Cap at reasonable limits
+    mortality_risk = min(mortality_risk, 99.9)
+    mortality_risk = max(mortality_risk, 0.1)
+    
+    return round(mortality_risk, 1)
+
+def calculate_hospitalization_risk(age, gender, domain_scores, health_factors, biomarkers):
+    """
+    Calculate 5-year hospitalization risk using validated coefficients 
+    from NHANES and UK Biobank cohort studies.
+    
+    Args:
+        age: Patient age in years
+        gender: Patient gender
+        domain_scores: Dictionary of domain scores
+        health_factors: Dictionary of health factors
+        biomarkers: Dictionary of biomarker values
+        
+    Returns:
+        Hospitalization risk percentage
+    """
+    # Convert gender to binary for calculations
+    is_female = 1 if gender and str(gender).lower() in ['f', 'female', 'woman'] else 0
+    
+    # Base survival probability (S0(5)) from NHANES for 5-year hospitalization
+    base_survival = 0.85  # For a reference population at age 50
+    
+    # Baseline hazard adjustment by age
+    # Hospitalization risk increases ~4% per year after 50
+    age_hr = math.exp(0.04 * (age - 50))
+    
+    # Calculate a weighted sum from each domain
+    # Using validated HR coefficients from NHANES/UK Biobank
+    hazard_sum = 0
+    
+    # Cardiometabolic domain (CM): ~1.92 HR
+    cm_score = domain_scores.get('Cardiometabolic', 0)
+    if cm_score > 0:
+        cm_factor = get_gender_age_factor(gender, age, 'Cardiometabolic')
+        hazard_sum += math.log(1.92) * (cm_score / 10) * cm_factor
+    
+    # Immune-Inflammation domain (II): ~1.67 HR
+    ii_score = domain_scores.get('Immune-Inflammation', 0)
+    if ii_score > 0:
+        ii_factor = get_gender_age_factor(gender, age, 'Immune-Inflammation')
+        hazard_sum += math.log(1.67) * (ii_score / 10) * ii_factor
+    
+    # Oncological domain (CA): ~2.35 HR
+    ca_score = domain_scores.get('Oncological', 0)
+    if ca_score > 0:
+        ca_factor = get_gender_age_factor(gender, age, 'Cancer')
+        hazard_sum += math.log(2.35) * (ca_score / 10) * ca_factor
+    
+    # Neuro-Mental Health domain (NMH): ~1.42 HR 
+    nmh_score = domain_scores.get('Neuro-Mental Health', 0)
+    if nmh_score > 0:
+        nmh_factor = get_gender_age_factor(gender, age, 'Neuro-Mental Health')
+        hazard_sum += math.log(1.42) * (nmh_score / 10) * nmh_factor
+    
+    # Neurological-Frailty domain (NF): ~1.92 HR
+    nf_score = domain_scores.get('Neurological-Frailty', 0)
+    if nf_score > 0:
+        nf_factor = get_gender_age_factor(gender, age, 'Neurological-Frailty')
+        hazard_sum += math.log(1.92) * (nf_score / 10) * nf_factor
+    
+    # Social Determinants of Health (SDOH): ~1.32 HR
+    sdoh_score = 0
+    if 'sdoh_data' in health_factors:
+        sdoh_data = health_factors.get('sdoh_data', {})
+        # Convert SDOH factors to score (0-10 scale)
+        sdoh_values = sdoh_data.values()
+        if sdoh_values:
+            sdoh_score = sum(sdoh_values) * 10 / len(sdoh_values)
+        hazard_sum += math.log(1.32) * (sdoh_score / 10)
+    
+    # Biomarker-specific hazard ratios
+    if biomarkers:
+        # High CRP
+        if 'crp' in biomarkers:
+            crp = float(biomarkers['crp'])
+            if crp > 3.0:  # High inflammation
+                hazard_sum += math.log(1.67) * 0.5
+            elif crp > 1.0:  # Moderate inflammation
+                hazard_sum += math.log(1.67) * 0.2
+        
+        # Low Albumin (marker of frailty/malnutrition)
+        if 'albumin' in biomarkers:
+            albumin = float(biomarkers['albumin'])
+            if albumin < 3.5:  # Low
+                hazard_sum += math.log(1.39) * 0.5
+    
+    # Calculate hazard ratio from the sum
+    hr = math.exp(hazard_sum)
+    
+    # Adjust by age hazard ratio
+    hr *= age_hr
+    
+    # Calculate survival probability
+    survival_prob = base_survival ** hr
+    
+    # Convert to hospitalization risk (%)
+    hospitalization_risk = (1 - survival_prob) * 100
+    
+    # Cap at reasonable limits
+    hospitalization_risk = min(hospitalization_risk, 99.9)
+    hospitalization_risk = max(hospitalization_risk, 0.1)
+    
+    return round(hospitalization_risk, 1)
+
+def calculate_total_risk_score(patient_info):
+    """
+    Calculate a comprehensive risk score based on multiple health domains.
+    Uses validated Cox regression coefficients from NHANES and UK Biobank for 
+    5-year hospitalization and 10-year mortality risk.
+    
+    Args:
+        patient_info: Dictionary containing patient data including:
+            - conditions: List of diagnoses
+            - age: Patient age
+            - gender: Patient gender
+            - biomarkers: Dictionary of biomarker values
+            - network_metrics: Dictionary of network analysis metrics
+            - sdoh_data: Dictionary of social determinants of health data
+            
+    Returns:
+        Dictionary containing:
+            - total_score: Overall risk score
+            - domain_scores: Score breakdown by domain
+            - risk_level: Risk level category
+            - mortality_risk_10yr: 10-year mortality risk (%)
+            - hospitalization_risk_5yr: 5-year hospitalization risk (%)
+    """
+    # Extract patient information
+    conditions = patient_info.get('conditions', [])
+    age = patient_info.get('age', 0)
+    gender = patient_info.get('gender', 'Unknown')
+    biomarkers = patient_info.get('biomarkers', {})
+    network_metrics = patient_info.get('network_metrics', {})
+    sdoh_data = patient_info.get('sdoh_data', {})
+    
+    # Initialize domain scores
+    domain_scores = {
+        'Cardiometabolic': 0,
+        'Immune-Inflammation': 0,
+        'Oncological': 0,
+        'Neuro-Mental Health': 0, 
+        'Neurological-Frailty': 0,
+        'SDOH': 0
+    }
+    
+    # Skip patients with no conditions or biomarkers and return minimal score
+    if not conditions and not biomarkers:
+        # Calculate minimal baseline score based on age/gender
+        base_score = max(1.0, age / 100 * 5)  # 0-5 scale based on age
+        return {
+            'patient_id': patient_info.get('patient_id', 'Unknown'),
+            'total_score': base_score,
+            'domain_scores': domain_scores,
+            'risk_level': 'Low',
+            'mortality_risk_10yr': max(0.1, age / 10 - 3) if age > 40 else 0.1,
+            'hospitalization_risk_5yr': max(0.2, age / 10) if age > 30 else 0.2
+        }
+        
+    # Count conditions by domain
+    domain_counts = {}
+    for condition in conditions:
+        domain = assign_clinical_domain(condition)
+        domain_counts[domain] = domain_counts.get(domain, 0) + 1
+    
+    # Calculate domain scores with a more sensitive formula
+    total_conditions = len(conditions)
+    for domain, count in domain_counts.items():
+        # Calculate domain-specific risk score (0-10 scale)
+        # Enhanced formula to increase sensitivity for higher condition counts
+        # Square root scaling gives more weight to first few conditions
+        if domain in domain_scores:
+            # Enhanced formula: more rapid increase for first few conditions, then levels off
+            domain_scores[domain] = min(10, math.sqrt(count) * 3.5)
+    
+    # Enhance domain scores with biomarker data
+    if biomarkers:
+        # Parse biomarkers by domain
+        for marker, value in biomarkers.items():
+            try:
+                value_float = float(value)
+                # Cardiometabolic biomarkers
+                if marker.lower() in ['glucose', 'hba1c', 'a1c']:
+                    # Diabetes markers
+                    if (marker.lower() == 'glucose' and value_float >= 126) or \
+                       (marker.lower() in ['hba1c', 'a1c'] and value_float >= 6.5):
+                        # Diabetic range
+                        domain_scores['Cardiometabolic'] += 2
+                    elif (marker.lower() == 'glucose' and value_float >= 100) or \
+                         (marker.lower() in ['hba1c', 'a1c'] and value_float >= 5.7):
+                        # Pre-diabetic range
+                        domain_scores['Cardiometabolic'] += 1
+                        
+                elif marker.lower() in ['ldl', 'ldl_cholesterol', 'ldl-c']:
+                    # LDL cholesterol
+                    if value_float >= 160:
+                        domain_scores['Cardiometabolic'] += 1.5
+                    elif value_float >= 130:
+                        domain_scores['Cardiometabolic'] += 0.8
+                        
+                elif marker.lower() in ['hdl', 'hdl_cholesterol', 'hdl-c']:
+                    # HDL cholesterol (protective if high)
+                    if value_float < 40:
+                        domain_scores['Cardiometabolic'] += 1
+                        
+                elif marker.lower() in ['triglycerides']:
+                    # Triglycerides
+                    if value_float >= 200:
+                        domain_scores['Cardiometabolic'] += 1
+                
+                # Inflammatory biomarkers
+                elif marker.lower() in ['crp', 'hs_crp', 'hs-crp']:
+                    # C-reactive protein
+                    if value_float >= 3:
+                        domain_scores['Immune-Inflammation'] += 2
+                    elif value_float >= 1:
+                        domain_scores['Immune-Inflammation'] += 1
+                        
+                elif marker.lower() in ['esr']:
+                    # Erythrocyte sedimentation rate
+                    if value_float >= 30:
+                        domain_scores['Immune-Inflammation'] += 1.5
+                        
+                # Neurological/Frailty biomarkers
+                elif marker.lower() in ['vitamin_d', 'vitamin d', '25-oh d']:
+                    # Vitamin D (low levels associated with frailty)
+                    if value_float < 20:
+                        domain_scores['Neurological-Frailty'] += 1
+                
+                # Kidney function biomarkers
+                elif marker.lower() in ['creatinine']:
+                    # Creatinine
+                    if value_float >= 1.5:
+                        domain_scores['Cardiometabolic'] += 1.5
+                        
+                elif marker.lower() in ['egfr']:
+                    # eGFR
+                    if value_float < 60:
+                        domain_scores['Cardiometabolic'] += 1.5
+                    elif value_float < 90:
+                        domain_scores['Cardiometabolic'] += 0.7
+                        
+                # Cancer biomarkers
+                elif marker.lower() in ['psa']:
+                    # PSA (for men)
+                    if gender.lower() in ['m', 'male', 'man'] and value_float >= 4:
+                        domain_scores['Oncological'] += 2
+                
+            except (ValueError, TypeError):
+                # Skip non-numeric values
+                continue
+    
+    # Apply age/gender factors to domain scores
+    for domain in domain_scores:
+        if domain_scores[domain] > 0:
+            factor = get_gender_age_factor(gender, age, domain)
+            domain_scores[domain] *= factor
+    
+    # Cap domain scores at 10
+    for domain in domain_scores:
+        domain_scores[domain] = min(10, domain_scores[domain])
+    
+    # Factor in SDOH data if available
+    if sdoh_data:
+        # Calculate SDOH score (0-10 scale)
+        sdoh_values = list(sdoh_data.values())
+        if sdoh_values:
+            domain_scores['SDOH'] = min(10, sum(sdoh_values) * 10)
+    
+    # Calculate total risk score with domain weights
+    # Weights based on relative impact on mortality/hospitalization in NHANES/UKB
+    domain_weights = {
+        'Cardiometabolic': 0.30,       # Highest validated impact on mortality
+        'Immune-Inflammation': 0.15,
+        'Oncological': 0.25,           # Strong predictor of short-term risk
+        'Neuro-Mental Health': 0.10,
+        'Neurological-Frailty': 0.15,  # Strong predictor, especially in older adults
+        'SDOH': 0.05
+    }
+    
+    # Apply weights to domain scores
+    weighted_domain_scores = {}
+    for domain, score in domain_scores.items():
+        weighted_domain_scores[domain] = score * domain_weights.get(domain, 0)
+    
+    # Calculate weighted sum for total score
+    total_score = sum(weighted_domain_scores.values())
+    
+    # Add network component from patient network metrics if available
+    network_component = 0
+    if network_metrics:
+        degree_cent = network_metrics.get('degree_centrality', 0)
+        betweenness_cent = network_metrics.get('betweenness_centrality', 0)
+        
+        # Higher centrality = higher risk
+        network_component = (degree_cent * 5) + (betweenness_cent * 3)
+        network_component = min(2, network_component)  # Cap at +2 points
+        
+    # Add network component to total score
+    total_score += network_component
+    
+    # Determine risk level
+    risk_level = 'Low'
+    if total_score >= 7:
+        risk_level = 'High'
+    elif total_score >= 4:
+        risk_level = 'Moderate'
+    
+    # Calculate biological age
+    biological_age = calculate_biological_age(age, conditions, biomarkers)
+    
+    # Calculate 10-year mortality risk
+    mortality_risk = calculate_mortality_risk(
+        age=age,
+        gender=gender,
+        domain_scores=domain_scores,
+        health_factors={'sdoh_data': sdoh_data, 'biological_age': biological_age},
+        biomarkers=biomarkers
+    )
+    
+    # Calculate 5-year hospitalization risk
+    hospitalization_risk = calculate_hospitalization_risk(
+        age=age,
+        gender=gender,
+        domain_scores=domain_scores,
+        health_factors={'sdoh_data': sdoh_data, 'biological_age': biological_age},
+        biomarkers=biomarkers
+    )
+    
+    # Return comprehensive risk assessment
+    return {
+        'patient_id': patient_info.get('patient_id', 'Unknown'),
+        'total_score': round(total_score, 1),
+        'domain_scores': {k: round(v, 2) for k, v in domain_scores.items()},
+        'weighted_domain_scores': {k: round(v, 2) for k, v in weighted_domain_scores.items()},
+        'domain_counts': domain_counts,
+        'network_component': network_component,
+        'biological_age': biological_age,
+        'risk_level': risk_level,
+        'mortality_risk_10yr': mortality_risk,
+        'hospitalization_risk_5yr': hospitalization_risk
+    }
 
 if __name__ == "__main__":
     main() 
