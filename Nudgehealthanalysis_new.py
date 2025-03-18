@@ -24,6 +24,7 @@ import openai
 from fpdf import FPDF
 from datetime import datetime
 import time
+import community as community_louvain
 
 try:
     from fuzzywuzzy import fuzz
@@ -32,10 +33,11 @@ except ImportError:
     FUZZY_AVAILABLE = False
 
 try:
-    from community import community_louvain
     COMMUNITY_DETECTION_AVAILABLE = True
+    logger.info("Community detection module loaded successfully")
 except ImportError:
     COMMUNITY_DETECTION_AVAILABLE = False
+    logger.warning("Community detection module not available. Install python-louvain for better analysis.")
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -1598,89 +1600,100 @@ def assign_clinical_domain(icd_code: str) -> str:
     # Default for unmatched codes
     return "Other"
 
-def create_domain_network(domain_df: pd.DataFrame) -> nx.Graph:
+def create_domain_network(df, domain_df):
     """
-    Create a network of conditions based on co-occurrence in patients.
+    Create a network of conditions based on patient diagnoses.
     
     Args:
-        domain_df: DataFrame with patient diagnoses and domains
+        df: DataFrame with patient and condition data
+        domain_df: DataFrame with domain information
         
     Returns:
-        NetworkX Graph with conditions as nodes and co-occurrence as edges
+        G: NetworkX graph object
     """
-    try:
-        G = nx.Graph()
+    if df is None or df.empty:
+        logger.warning("No data available for network creation")
+        return None
         
-        # Ensure we have data and required columns
-        if domain_df is None or domain_df.empty:
-            logger.warning("No data provided for network creation")
-            return G
-            
-        if 'patient_id' not in domain_df.columns or 'condition' not in domain_df.columns:
-            logger.warning("Required columns missing from input data")
-            return G
-        
-        # Get unique conditions and add as nodes
-        conditions = domain_df['condition'].unique()
-        logger.info(f"Adding {len(conditions)} nodes to network")
-        
-        # Add each condition as a node with its domain as attribute
-        for condition in conditions:
-            # Get the most common domain for this condition
-            domain_counts = domain_df[domain_df['condition'] == condition]['domain'].value_counts()
-            domain = domain_counts.index[0] if len(domain_counts) > 0 else 'Other'
-            G.add_node(condition, domain=domain)
-        
-        # Group by patient to find co-occurring conditions
-        patient_conditions = domain_df.groupby('patient_id')['condition'].apply(list).reset_index()
-        
-        # Add edges for co-occurring conditions
-        edge_weights = {}
-        
-        # Create progress counter
-        progress_counter = 0
-        total_patients = len(patient_conditions)
-        
-        for _, row in patient_conditions.iterrows():
-            # Update progress counter
-            progress_counter += 1
-            if progress_counter % 100 == 0:
-                logger.info(f"Processing edges: {progress_counter}/{total_patients} patients")
-                
-            conditions_list = row['condition']
-            
-            # Only process if patient has multiple conditions
-            if len(conditions_list) < 2:
-                continue
-                
-            # Create all pairwise combinations of conditions
-            for i in range(len(conditions_list)):
-                for j in range(i+1, len(conditions_list)):
-                    condition1 = conditions_list[i]
-                    condition2 = conditions_list[j]
-                    
-                    # Skip identical conditions
-                    if condition1 == condition2:
-                        continue
-                        
-                    # Create a unique key for this pair (order doesn't matter)
-                    edge_key = tuple(sorted([condition1, condition2]))
-                    
-                    if edge_key in edge_weights:
-                        edge_weights[edge_key] += 1
-                    else:
-                        edge_weights[edge_key] = 1
-        
-        # Add edges to the graph with weights
-        logger.info(f"Adding {len(edge_weights)} edges to network")
-        for (condition1, condition2), weight in edge_weights.items():
-            G.add_edge(condition1, condition2, weight=weight)
-            
-        return G
+    if 'patient_id' not in df.columns or 'condition' not in df.columns:
+        logger.warning("Required columns (patient_id, condition) not found in data")
+        return None
     
-    except Exception as e:
-        logger.error(f"Error creating domain network: {str(e)}")
-        return nx.Graph()
+    # Initialize graph
+    G = nx.Graph()
+    
+    # Get unique conditions
+    unique_conditions = df['condition'].unique()
+    logger.info(f"Adding {len(unique_conditions)} nodes to network")
+    
+    # Add nodes for each condition
+    for condition in unique_conditions:
+        # Get domain for this condition
+        domain = assign_clinical_domain(condition)
+        G.add_node(condition, domain=domain)
+    
+    # Group conditions by patient
+    patient_conditions = df.groupby('patient_id')['condition'].apply(list).to_dict()
+    
+    # Create edges between conditions that co-occur in patients
+    total_patients = len(patient_conditions)
+    progress_counter = 0
+    progress_step = 100
+    edge_weights = defaultdict(int)
+    
+    # Count co-occurrences
+    for patient_id, conditions in patient_conditions.items():
+        progress_counter += 1
+        if progress_counter % progress_step == 0:
+            logger.info(f"Processing edges: {progress_counter}/{total_patients} patients")
+            
+        # Only process if patient has multiple conditions
+        if len(conditions) > 1:
+            # Create pairs of conditions
+            for i in range(len(conditions)):
+                for j in range(i+1, len(conditions)):
+                    condition1 = conditions[i]
+                    condition2 = conditions[j]
+                    
+                    # Increment edge weight
+                    edge_key = tuple(sorted([condition1, condition2]))
+                    edge_weights[edge_key] += 1
+    
+    # Add edges to graph with weights
+    edge_count = 0
+    for (condition1, condition2), weight in edge_weights.items():
+        # Only add edges with sufficient weight (co-occur in at least 2 patients)
+        if weight >= 2:
+            G.add_edge(condition1, condition2, weight=weight)
+            edge_count += 1
+    
+    logger.info(f"Adding {edge_count} edges to network")
+    
+    # If no edges were created, add some minimal edges to avoid community detection errors
+    if edge_count == 0 and len(unique_conditions) > 1:
+        logger.warning("No significant condition relationships found. Adding minimal edges.")
+        # Group conditions by domain
+        domain_conditions = defaultdict(list)
+        for condition in unique_conditions:
+            domain = assign_clinical_domain(condition)
+            domain_conditions[domain].append(condition)
+            
+        # Add at least one edge per domain if possible
+        for domain, conditions in domain_conditions.items():
+            if len(conditions) > 1:
+                for i in range(len(conditions)-1):
+                    G.add_edge(conditions[i], conditions[i+1], weight=1)
+                    edge_count += 1
+            elif len(conditions) == 1 and domain_conditions:
+                # Connect to another domain's condition
+                other_domain = next((d for d in domain_conditions.keys() if d != domain and domain_conditions[d]), None)
+                if other_domain and domain_conditions[other_domain]:
+                    G.add_edge(conditions[0], domain_conditions[other_domain][0], weight=1)
+                    edge_count += 1
+        
+        logger.info(f"Added {edge_count} minimal edges to allow community detection")
+    
+    return G
 
 def calculate_condition_correlations(domain_df, method='pearson'):
     """
@@ -1785,6 +1798,22 @@ def visualize_network_with_communities(G, domain_df):
         return None
         
     try:
+        # Community detection - with error handling
+        communities = {}
+        try:
+            if COMMUNITY_DETECTION_AVAILABLE and G.number_of_edges() > 0:
+                partition = community_louvain.best_partition(G)
+                communities = defaultdict(list)
+                for node, community_id in partition.items():
+                    communities[community_id].append(node)
+                logger.info(f"Detected {len(communities)} communities in the network")
+            else:
+                # Fallback without community detection
+                logger.warning("Skipping community detection - not available or no edges")
+        except Exception as e:
+            logger.error(f"Error in community detection: {str(e)}")
+            # Continue without community detection
+        
         # Set up domain colors
         domain_colors = {
             'Cardiometabolic': '#e41a1c',         # Red
@@ -1882,14 +1911,17 @@ def visualize_network_with_communities(G, domain_df):
             domain_node_traces[domain]['x'] = domain_node_traces[domain]['x'] + (x,)
             domain_node_traces[domain]['y'] = domain_node_traces[domain]['y'] + (y,)
             domain_node_traces[domain]['text'] = domain_node_traces[domain]['text'] + (hover_text,)
+            
             # Scale node size by degree (connections)
             size = 10 + (degree * 2)
-            if 'marker.size' not in domain_node_traces[domain]:
+            if 'marker' not in domain_node_traces[domain]:
+                domain_node_traces[domain]['marker'] = {}
+            if 'size' not in domain_node_traces[domain]['marker']:
                 domain_node_traces[domain]['marker']['size'] = []
-            domain_node_traces[domain]['marker']['size'] = domain_node_traces[domain]['marker']['size'] + (size,)
+            domain_node_traces[domain]['marker']['size'].append(size)
         
         # Create a figure
-        fig = go.Figure(data=edge_trace + list(domain_node_traces.values()))
+        fig = go.Figure(data=edge_trace + [trace for trace in domain_node_traces.values() if len(trace['x']) > 0])
         
         # Filter out empty domains for the legend
         active_domains = [domain for domain, count in domain_counts.items() if count > 0]
@@ -1910,10 +1942,49 @@ def visualize_network_with_communities(G, domain_df):
             yaxis=dict(showgrid=False, zeroline=False, showticklabels=False)
         )
         
+        # Add community annotations if available
+        if communities:
+            annotations = []
+            for community_id, nodes in communities.items():
+                if len(nodes) > 2:  # Only annotate larger communities
+                    # Get central position of this community
+                    x_pos = [pos[node][0] for node in nodes if node in pos]
+                    y_pos = [pos[node][1] for node in nodes if node in pos]
+                    if x_pos and y_pos:
+                        comm_x = sum(x_pos) / len(x_pos)
+                        comm_y = sum(y_pos) / len(y_pos)
+                        
+                        # Count domains in this community
+                        domain_counts = {}
+                        for node in nodes:
+                            domain = G.nodes[node].get('domain', 'Other')
+                            domain_counts[domain] = domain_counts.get(domain, 0) + 1
+                        
+                        # Find dominant domain
+                        if domain_counts:
+                            dominant_domain = max(domain_counts, key=domain_counts.get)
+                            
+                            # Add annotation
+                            annotations.append(dict(
+                                x=comm_x,
+                                y=comm_y,
+                                xref="x",
+                                yref="y",
+                                text=f"Community {community_id}<br>({dominant_domain})",
+                                showarrow=True,
+                                arrowhead=1,
+                                ax=0,
+                                ay=-40
+                            ))
+            
+            if annotations:
+                fig.update_layout(annotations=annotations)
+        
         return fig
         
     except Exception as e:
         logger.error(f"Error visualizing network: {str(e)}")
+        traceback.print_exc()  # Print full traceback for debugging
         return None
 
 def get_condition_severity(condition: str, biomarkers: dict = None) -> str:
