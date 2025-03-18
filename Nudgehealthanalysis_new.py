@@ -2125,22 +2125,26 @@ def main():
         st.session_state.icd_codes = icd_codes
         st.session_state.biomarker_refs = biomarker_refs
     
-    # OpenAI API key input in sidebar
-    st.sidebar.subheader("OpenAI Settings (Optional)")
-    api_key = st.sidebar.text_input("OpenAI API Key (for AI recommendations)", 
-                                   type="password", 
-                                   help="Enter your OpenAI API key to enable AI clinical recommendations")
-    if api_key:
-        st.session_state.openai_api_key = api_key
-        os.environ["OPENAI_API_KEY"] = api_key
-    else:
-        # Try to get API key from secrets
-        try:
-            api_key = st.secrets["OPENAI_API_KEY"]
-            if api_key and api_key != "your-api-key-here":
-                st.session_state.openai_api_key = api_key
-                os.environ["OPENAI_API_KEY"] = api_key
-        except Exception as e:
+    # OpenAI API key handling
+    try:
+        api_key = st.secrets["OPENAI_API_KEY"]
+        if api_key and api_key != "your-api-key-here":
+            st.session_state.openai_api_key = api_key
+            os.environ["OPENAI_API_KEY"] = api_key
+            st.sidebar.success("OpenAI API key configured")
+        else:
+            st.sidebar.warning("Please set your OpenAI API key in Streamlit secrets")
+    except Exception as e:
+        # Only show input field if no API key in secrets
+        st.sidebar.subheader("OpenAI Settings (Optional)")
+        api_key = st.sidebar.text_input("OpenAI API Key (for AI recommendations)", 
+                                      type="password", 
+                                      help="Enter your OpenAI API key to enable AI clinical recommendations")
+        if api_key:
+            st.session_state.openai_api_key = api_key
+            os.environ["OPENAI_API_KEY"] = api_key
+            st.sidebar.success("OpenAI API key configured")
+        else:
             st.sidebar.info("No OpenAI API key found. AI recommendations will be disabled.")
     
     st.sidebar.divider()
