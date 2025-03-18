@@ -620,201 +620,70 @@ def fetch_biomarker_reference_data():
 
 def process_diagnosis_data(df):
     """
-    Process the input diagnosis data, handling both ICD-10 codes and text descriptions.
-    Transforms wide format diagnosis data into long format with domains assigned.
+    Process raw diagnosis data into a standardized format.
     
     Args:
-        df: DataFrame containing patient diagnosis data
+        df: Raw DataFrame from Excel or other source
         
     Returns:
-        Processed DataFrame in long format with domains assigned
+        Processed DataFrame with standardized columns
     """
     try:
-        # Make a copy to avoid modifying the original
-        df_copy = df.copy()
-        
-        # Standardize column names (case insensitive)
-        df_copy.columns = [col.lower() for col in df_copy.columns]
-        
-        # Map common column variations to standard names
-        column_mappings = {
-            'pat id': 'patid', 
-            'patient id': 'patid',
-            'patientid': 'patid',
-            'sex': 'gender',
-            'age_years': 'age',
-            'icd10': 'diagnosis',
-            'icd_10': 'diagnosis',
-            'icd code': 'diagnosis',
-            'icd-10 code': 'diagnosis',
-            'diagnosis code': 'diagnosis',
-            'condition': 'diagnosis_text',
-            'diagnosis description': 'diagnosis_text',
-            'description': 'diagnosis_text'
-        }
-        
-        # Apply column mappings where applicable
-        for old_col, new_col in column_mappings.items():
-            if old_col in df_copy.columns and new_col not in df_copy.columns:
-                df_copy.rename(columns={old_col: new_col}, inplace=True)
-        
-        # Function to find the best matching column for a target
-        def find_best_column_match(target, possible_names):
-            # First try exact matches
-            if target in df_copy.columns:
-                return target
-            
-            # Then try partial matches
-            for col in df_copy.columns:
-                if any(name in col for name in possible_names):
-                    return col
-            
-            return None
-        
-        # Find diagnosis columns - both codes and text descriptions
-        diag_cols = []
-        text_cols = []
-        
-        # Check for dedicated diagnosis columns
-        diag_col = find_best_column_match('diagnosis', ['diagnosis', 'icd', 'code'])
-        if diag_col:
-            diag_cols.append(diag_col)
-        
-        # Check for diagnosis text/description columns
-        text_col = find_best_column_match('diagnosis_text', ['text', 'desc', 'condition'])
-        if text_col:
-            text_cols.append(text_col)
-        
-        # If no dedicated columns found, look for diagnosis1, diagnosis2, etc.
-        if not diag_cols:
-            diag_pattern = re.compile(r'(diagnosis|icd|dx).*?(\d+)', re.IGNORECASE)
-            for col in df_copy.columns:
-                if diag_pattern.search(col):
-                    diag_cols.append(col)
-        
-        # If no text description columns found, look for matching patterns
-        if not text_cols:
-            text_pattern = re.compile(r'(desc|text|condition).*?(\d+)', re.IGNORECASE)
-            for col in df_copy.columns:
-                if text_pattern.search(col):
-                    text_cols.append(col)
-        
-        # If still no diagnosis columns found, try to infer from data patterns
-        if not diag_cols:
-            for col in df_copy.columns:
-                # Sample values to check for ICD code patterns
-                sample_values = df_copy[col].dropna().astype(str).iloc[:10].tolist()
-                icd_pattern = re.compile(r'^[A-Z]\d{2}(\.\d+)?$')
-                if any(icd_pattern.match(val) for val in sample_values):
-                    diag_cols.append(col)
-        
-        # Ensure we have required columns
-        required_columns = ['patid', 'age', 'gender']
-        for col in required_columns:
-            if col not in df_copy.columns:
-                st.error(f"Missing required column: {col}")
-                return pd.DataFrame()
-        
-        # Create patient_id column if it doesn't exist
-        if 'patient_id' not in df_copy.columns:
-            if 'patid' in df_copy.columns:
-                df_copy['patient_id'] = df_copy['patid'].astype(str)
-            else:
-                st.error("No patient identifier column found")
-                return pd.DataFrame()
-        
-        # Process data into long format if in wide format
-        if diag_cols:
-            # Check if already in long format or wide format
-            if len(diag_cols) == 1 and df_copy[diag_cols[0]].notna().sum() == len(df_copy):
-                # Already in long format - just need to standardize
-                long_df = df_copy.copy()
-                long_df.rename(columns={diag_cols[0]: 'diagnosis'}, inplace=True)
-                
-                # Add diagnosis_text if available
-                if text_cols and len(text_cols) == 1:
-                    long_df.rename(columns={text_cols[0]: 'diagnosis_text'}, inplace=True)
-            else:
-                # Convert from wide to long format
-                id_vars = [col for col in df_copy.columns if col not in diag_cols + text_cols]
-                
-                # Process diagnosis codes
-                long_df = pd.melt(
-                    df_copy, 
-                    id_vars=id_vars,
-                    value_vars=diag_cols,
-                    var_name='diagnosis_column',
-                    value_name='diagnosis'
-                )
-                
-                # Drop rows with missing diagnoses
-                long_df = long_df[long_df['diagnosis'].notna()]
-                
-                # Extract diagnosis text if available and match with codes
-                if text_cols:
-                    # Create mapping between diagnosis columns and text columns
-                    text_mapping = {}
-                    
-                    # Try to match diagnosis1 with description1, etc.
-                    for diag_col in diag_cols:
-                        diag_num = re.search(r'(\d+)', diag_col)
-                        if diag_num:
-                            num = diag_num.group(1)
-                            for text_col in text_cols:
-                                if num in text_col:
-                                    text_mapping[diag_col] = text_col
-                                    break
-                    
-                    # Add text descriptions based on mapping
-                    if text_mapping:
-                        def get_text_for_diagnosis(row):
-                            diag_col = row['diagnosis_column']
-                            if diag_col in text_mapping:
-                                text_col = text_mapping[diag_col]
-                                return df_copy.loc[row.name, text_col]
-                            return None
-                        
-                        long_df['diagnosis_text'] = long_df.apply(get_text_for_diagnosis, axis=1)
-            
-            # Assign clinical domain for each diagnosis
-            long_df['diagnosis'] = long_df['diagnosis'].astype(str).str.strip().str.upper()
-            
-            # Clean diagnosis codes for better pattern matching (remove punctuation)
-            long_df['clean_code'] = long_df['diagnosis'].str.replace('.', '').str.strip()
-            
-            # Assign clinical domain for each diagnosis
-            long_df['domain'] = long_df['clean_code'].apply(assign_clinical_domain)
-            
-            # Clean up the final dataframe
-            if 'diagnosis_column' in long_df.columns:
-                long_df.drop('diagnosis_column', axis=1, inplace=True)
-            
-            # Drop temporary column
-            long_df.drop('clean_code', axis=1, inplace=True)
-            
-            # Rename 'diagnosis' to 'condition' for consistency
-            long_df.rename(columns={'diagnosis': 'condition'}, inplace=True)
-            if 'diagnosis_text' in long_df.columns:
-                # If we have text descriptions and no valid ICD code in condition,
-                # use the text as the condition
-                mask = long_df['domain'] == 'Unknown'
-                if mask.any() and 'diagnosis_text' in long_df.columns:
-                    long_df.loc[mask, 'condition'] = long_df.loc[mask, 'diagnosis_text']
-                    # Try to assign domain based on text description
-                    long_df.loc[mask, 'domain'] = long_df.loc[mask, 'diagnosis_text'].apply(
-                        lambda x: assign_domain_from_text(x) if pd.notna(x) else 'Unknown'
-                    )
-            
-            # Filter out rows with Unknown domain if requested
-            # long_df = long_df[long_df['domain'] != 'Unknown']
-            
-            return long_df
-        else:
-            st.error("No diagnosis columns found in the data")
+        if df is None or df.empty:
+            logger.warning("Empty dataframe provided to process_diagnosis_data")
             return pd.DataFrame()
-    
+            
+        # Create a copy to avoid modifying the original
+        processed_df = df.copy()
+        
+        # Standardize patient ID column
+        if 'patient_id' not in processed_df.columns:
+            # Look for common patient ID column names
+            possible_id_columns = ['PatId', 'Pat Id', 'Patient ID', 'PatientID', 'patient id', 'MRN']
+            for col in possible_id_columns:
+                if col in processed_df.columns:
+                    processed_df['patient_id'] = processed_df[col]
+                    logger.info(f"Renamed {col} to patient_id")
+                    break
+            
+            # If still no patient_id column, try to create one
+            if 'patient_id' not in processed_df.columns:
+                if processed_df.index.name in possible_id_columns:
+                    # Use index as patient_id
+                    processed_df['patient_id'] = processed_df.index
+                    logger.info("Using index as patient_id")
+                else:
+                    # Generate sequential IDs
+                    processed_df['patient_id'] = [f"P{i+1:04d}" for i in range(len(processed_df))]
+                    logger.info("Generated sequential patient_id values")
+        
+        # Process age column if available
+        if 'age' in processed_df.columns:
+            # Convert to numeric, handle errors
+            processed_df['age'] = pd.to_numeric(processed_df['age'], errors='coerce')
+            # Fill missing values
+            processed_df['age'] = processed_df['age'].fillna(0)
+            
+        # Process gender column if available
+        if 'gender' in processed_df.columns:
+            # Standardize gender values
+            gender_map = {
+                'm': 'Male', 'male': 'Male', 'man': 'Male', '1': 'Male', 'mal': 'Male',
+                'f': 'Female', 'female': 'Female', 'woman': 'Female', '2': 'Female', 'fem': 'Female'
+            }
+            
+            # Convert gender to lowercase for mapping
+            processed_df['gender'] = processed_df['gender'].astype(str).str.lower()
+            # Map to standardized values
+            processed_df['gender'] = processed_df['gender'].map(lambda x: gender_map.get(x, 'Unknown'))
+        else:
+            processed_df['gender'] = 'Unknown'
+        
+        # Return processed dataframe
+        logger.info(f"Processed diagnosis data for {len(processed_df)} patients")
+        return processed_df
+        
     except Exception as e:
-        st.error(f"Error processing diagnosis data: {str(e)}")
         logger.error(f"Error in process_diagnosis_data: {str(e)}")
         return pd.DataFrame()
 
@@ -907,8 +776,16 @@ def analyze_comorbidity_data(icd_df, valid_icd_codes=None):
                 'correlations': None
             }
             
-        # Process the data into domain format
+        # Process the data into domain format if needed
         start_time = time.time()
+        
+        # Check if domain columns already exist
+        if 'domain' not in icd_df.columns:
+            # Process data into domains, finding appropriate diagnosis columns
+            diag_cols = []
+            for col in icd_df.columns:
+                if any(term in col.lower() for term in ['icd', 'diagnosis', 'condition']):
+                    diag_cols.append(col)
         domain_df = process_domain_data(icd_df, ['icd_code', 'icd_description'])
         processing_time = time.time() - start_time
         logger.info(f"Domain data processing completed in {processing_time:.2f} seconds")
@@ -1206,10 +1083,10 @@ def perform_combined_analysis(domain_df, biomarker_df):
             with col1:
                 st.metric("Total Patients", combined_df['patient_id'].nunique())
             with col2:
-                high_risk = len([s for s in risk_scores if s > 7])
+                high_risk = len([s for s in risk_scores if s > 7]) if risk_scores else 0
                 st.metric("High Risk Patients", high_risk)
             with col3:
-                avg_score = sum(risk_scores) / len(risk_scores) if risk_scores else 0
+                avg_score = sum(risk_scores) / len(risk_scores) if risk_scores and len(risk_scores) > 0 else 0
                 st.metric("Average Risk Score", f"{avg_score:.2f}")
             with col4:
                 # Calculate average mortality risk
@@ -1357,37 +1234,67 @@ def perform_combined_analysis(domain_df, biomarker_df):
         st.write(f"Error details: {str(e)}")
 
 def process_domain_data(df: pd.DataFrame, diag_cols: list) -> pd.DataFrame:
-    """Process diagnosis data into clinical domains."""
-    try:
-        domain_records = []
+    """
+    Process raw diagnosis data into a standardized domain dataframe.
+    
+    Args:
+        df: DataFrame containing diagnosis data
+        diag_cols: List of column names that contain diagnosis information
         
-        for _, row in df.iterrows():
-            patient_data = {
-                'patient_id': row.get('patient_id', 'Unknown'),
-                'age': row.get('age', 0),
-                'gender': row.get('gender', 'Unknown')
-            }
+    Returns:
+        Processed DataFrame with patient_id, condition, and domain columns
+    """
+    if df is None or df.empty:
+        logger.warning("Empty dataframe provided to process_domain_data")
+        return pd.DataFrame()
+        
+    # Ensure patient_id is present
+    if 'patient_id' not in df.columns and 'PatId' in df.columns:
+        df['patient_id'] = df['PatId']
+    elif 'patient_id' not in df.columns:
+        logger.warning("No patient ID column found in dataframe")
+        return pd.DataFrame()
+    
+    # Start with a clean slate
+    processed_rows = []
+    
+    # Process each row
+    for _, row in df.iterrows():
+        patient_id = row['patient_id']
+        
+        # Extract demographics if available
+        age = row.get('age', 0)
+        if pd.isna(age):
+            age = 0
             
-            # Process each diagnosis
-            for col in diag_cols:
-                diagnosis = str(row.get(col, '')).strip()
-                if pd.notna(diagnosis) and diagnosis != '' and diagnosis.lower() != 'nan':
-                    domain = assign_clinical_domain(diagnosis)
-                    record = patient_data.copy()
-                    record.update({
-                        'condition': diagnosis,
-                        'domain': domain
+        gender = row.get('gender', 'Unknown')
+        if pd.isna(gender):
+            gender = 'Unknown'
+        
+        # Extract all diagnoses from the relevant columns
+        for col in diag_cols:
+            if col in row and not pd.isna(row[col]):
+                condition = str(row[col]).strip()
+                if condition and condition not in ['nan', 'None', '']:
+                    # Determine domain for this condition
+                    domain = assign_clinical_domain(condition)
+                    
+                    # Add to processed data
+                    processed_rows.append({
+                        'patient_id': patient_id,
+                        'condition': condition,
+                        'domain': domain,
+                        'age': age,
+                        'gender': gender
                     })
-                    domain_records.append(record)
-        
-        if domain_records:
-            domain_df = pd.DataFrame(domain_records)
-            return domain_df
-        else:
-            return pd.DataFrame()
-            
-    except Exception as e:
-        logger.error(f"Error in process_domain_data: {str(e)}")
+    
+    # Create processed dataframe
+    if processed_rows:
+        processed_df = pd.DataFrame(processed_rows)
+        logger.info(f"Processed {len(processed_rows)} conditions across {processed_df['patient_id'].nunique()} patients")
+        return processed_df
+    else:
+        logger.warning("No valid conditions found in dataframe")
         return pd.DataFrame()
 
 def assign_clinical_domain(icd_code: str) -> str:
@@ -2011,144 +1918,46 @@ def get_condition_severity(condition: str, biomarkers: dict = None) -> str:
 
 def calculate_total_risk_score(patient_data: dict) -> dict:
     """
-    Calculate the total risk score for a patient based on their conditions, biomarkers, etc.
+    Calculate the total risk score for a patient using NHCRS model.
     
     Args:
         patient_data: Dictionary containing patient information including:
-                     - conditions: list of conditions/diagnoses
-                     - age: patient age
-                     - gender: patient gender
-                     - biomarkers: dictionary of biomarker values
-                     - sdoh_data: dictionary of social determinants of health data
-                     
+            - conditions: List of medical conditions
+            - age: Patient age
+            - gender: Patient gender
+            - biomarkers: Dictionary of biomarker values
+            - sdoh_data: Dictionary of social determinants of health
+            
     Returns:
-        Dictionary containing:
-        - total_score: total NHCRS score
-        - domain_scores: dictionary of scores for each domain
-        - mortality_risk_10yr: 10-year mortality risk percentage
-        - hospitalization_risk_5yr: 5-year hospitalization risk percentage
+        Dictionary containing total score, domain scores, and risk percentages
     """
-    try:
-        # Extract required data
-        conditions = patient_data.get('conditions', [])
-        age = patient_data.get('age', 0)
-        gender = patient_data.get('gender', 'Unknown')
-        biomarkers = patient_data.get('biomarkers', {})
-        sdoh_data = patient_data.get('sdoh_data', {})
-        
-        # Initialize default domain scores
-        domain_scores = {
-            'Cardiometabolic': 0.0,
-            'Immune-Inflammation': 0.0,
-            'Oncological': 0.0,
-            'Neuro-Mental Health': 0.0,
-            'Neurological-Frailty': 0.0,
-            'SDOH': 0.0
-        }
-        
-        # Get domain counts if available
-        domain_condition_counts = patient_data.get('domain_condition_counts', {})
-        
-        # Skip risk calculation for patients with no conditions
-        if not conditions and not biomarkers:
-            # Return minimal risk scores
-            return {
-                'total_score': 1.0,  # Baseline score
-                'domain_scores': domain_scores,
-                'mortality_risk_10yr': 1.0,  # Baseline mortality risk
-                'hospitalization_risk_5yr': 0.5  # Baseline hospitalization risk
-            }
-        
-        # Calculate risk score for each domain
-        total_conditions = len(conditions)
-        
-        # Calculate risk score for each domain using conditions
-        if conditions:
-            for domain in domain_scores.keys():
-                # If we have precalculated domain counts, use them
-                if domain in domain_condition_counts:
-                    # Calculate proportion of conditions in this domain and scale to be more sensitive
-                    domain_proportion = domain_condition_counts[domain] / max(1, total_conditions)
-                    # Base domain risk on proportion and count
-                    condition_count = domain_condition_counts[domain]
-                    
-                    # Scale the score to make it more sensitive
-                    # Higher condition counts should have exponentially higher impact
-                    score_factor = 1.0  # Default factor
-                    if condition_count > 5:
-                        score_factor = 1.5
-                    elif condition_count > 10:
-                        score_factor = 2.0
-                    elif condition_count > 15:
-                        score_factor = 2.5
-                        
-                    # Use a more sensitive formula with increased weight for higher counts
-                    domain_score = (domain_proportion * 5.0) * math.sqrt(condition_count) * score_factor
-                    domain_scores[domain] = min(10.0, domain_score)  # Cap at 10.0
-                else:
-                    # Legacy calculation - calculate domain-specific risk
-                    domain_score = calculate_domain_risk_score(
-                        conditions, domain, age, gender, biomarkers, sdoh_data
-                    )
-                    domain_scores[domain] = domain_score
-        
-        # Enhance scores with biomarker data if available
-        if biomarkers:
-            # Add biomarker contributions to each domain
-            for domain in domain_scores.keys():
-                biomarker_score = calculate_biomarker_component(biomarkers, domain)
-                
-                # Add the biomarker score, but ensure we don't exceed max
-                domain_scores[domain] = min(10.0, domain_scores[domain] + biomarker_score)
-        
-        # Apply age and gender factors to each domain
-        for domain in domain_scores.keys():
-            gender_age_factor = get_gender_age_factor(domain, gender, age)
-            
-            # Apply the gender-age factor as a multiplier
-            domain_scores[domain] = min(10.0, domain_scores[domain] * gender_age_factor)
-            
-        # Apply SDOH modifiers if available
-        if sdoh_data:
-            for domain in domain_scores.keys():
-                sdoh_modifier = calculate_sdoh_modifier(sdoh_data, domain)
-                
-                # Apply the SDOH modifier
-                domain_scores[domain] = min(10.0, domain_scores[domain] * sdoh_modifier)
-        
-        # Calculate final NHCRS total score with weighted domain contributions
-        domain_weights = {
-            'Cardiometabolic': 0.25,          # High impact on mortality and hospitalization
-            'Immune-Inflammation': 0.15,      # Moderate impact
-            'Oncological': 0.25,              # High impact on mortality
-            'Neuro-Mental Health': 0.15,      # Moderate impact on hospitalization
-            'Neurological-Frailty': 0.15,     # Moderate impact, high in elderly
-            'SDOH': 0.05                      # Lower direct impact
-        }
-        
-        # Apply domain weights to calculate total score
-        weighted_score = 0.0
-        for domain, score in domain_scores.items():
-            weighted_score += score * domain_weights.get(domain, 0.0)
-            
-        # Add a network component if available
-        network_metrics = patient_data.get('network_metrics', {})
-        if network_metrics:
-            degree_cent = network_metrics.get('degree_centrality', 0)
-            betweenness_cent = network_metrics.get('betweenness_centrality', 0)
-            
-            # Add a network component to the score (0-2 points)
-            network_score = (degree_cent * 1.0) + (betweenness_cent * 1.0)
-            weighted_score += network_score
-        
-        # Get final NHCRS total (baseline + weighted contributions)
-        total_score = 1.0 + weighted_score  # Baseline of 1.0
-        
-        # Calculate mortality and hospitalization risks based on total score
+    # Initialize domain scores
+    domain_scores = {
+        'Cardiometabolic': 1.0,
+        'Immune-Inflammation': 1.0,
+        'Oncological': 1.0,
+        'Neuro-Mental Health': 1.0,
+        'Neurological-Frailty': 1.0,
+        'SDOH': 1.0
+    }
+    
+    # Extract patient info
+    conditions = patient_data.get('conditions', [])
+    age = patient_data.get('age', 0)
+    gender = patient_data.get('gender', 'Unknown')
+    biomarkers = patient_data.get('biomarkers', {})
+    sdoh_data = patient_data.get('sdoh_data', {})
+    network_metrics = patient_data.get('network_metrics', {})
+    
+    # Skip detailed calculation for patients without conditions or biomarkers
+    # but assign minimal baseline scores
+    if not conditions and not biomarkers:
+        logger.info(f"Patient has no conditions or biomarkers, assigning baseline scores")
+        # Calculate baseline total
+        total_score = calculate_nhcrs_total(domain_scores)
         mortality_risk = calculate_mortality_risk(total_score)
         hospitalization_risk = calculate_hospitalization_risk(total_score)
         
-        # Return results
         return {
             'total_score': total_score,
             'domain_scores': domain_scores,
@@ -2156,14 +1965,96 @@ def calculate_total_risk_score(patient_data: dict) -> dict:
             'hospitalization_risk_5yr': hospitalization_risk
         }
     
-    except Exception as e:
-        logger.error(f"Error calculating risk score: {str(e)}")
-        return {
-            'total_score': 1.0,
-            'domain_scores': {'Other': 1.0},
-            'mortality_risk_10yr': 1.0,
-            'hospitalization_risk_5yr': 0.5
-        }
+    # Count conditions by domain
+    domain_condition_counts = {}
+    for condition in conditions:
+        domain = assign_clinical_domain(condition)
+        if domain not in domain_condition_counts:
+            domain_condition_counts[domain] = 0
+        domain_condition_counts[domain] += 1
+    
+    # Calculate base score for each domain using a more nuanced formula
+    # that increases more significantly with higher condition counts
+    for domain in domain_scores:
+        condition_count = domain_condition_counts.get(domain, 0)
+        
+        # Apply more sensitive formula: 1 + log(1+count)*2 gives a steeper curve
+        # 0 conditions = 1.0, 1 condition = 1.7, 2 = 2.1, 3 = 2.4, 5 = 2.8, 10 = 3.4
+        if condition_count > 0:
+            domain_scores[domain] = 1.0 + math.log1p(condition_count) * 2.0
+    
+    # Enhanced scoring: Increase impact of multiple conditions in a domain
+    total_conditions = len(conditions)
+    if total_conditions > 0:
+        # Add additional points for distribution of conditions across domains
+        domains_with_conditions = sum(1 for count in domain_condition_counts.values() if count > 0)
+        
+        # More domains affected = higher risk, max +2 points
+        domain_distribution_factor = min(domains_with_conditions * 0.4, 2.0)
+        
+        # Add this factor to each domain that has conditions
+        for domain in domain_scores:
+            if domain_condition_counts.get(domain, 0) > 0:
+                domain_scores[domain] += domain_distribution_factor
+    
+    # Integrate biomarker data to enhance domain scores
+    if biomarkers:
+        for domain in domain_scores:
+            biomarker_component = calculate_biomarker_component(biomarkers, domain)
+            if biomarker_component > 0:
+                # Add biomarker component to domain score
+                domain_scores[domain] += biomarker_component
+    
+    # Apply age and gender factors to adjust domain scores
+    for domain in domain_scores:
+        gender_age_factor = get_gender_age_factor(domain, gender, age)
+        domain_scores[domain] *= gender_age_factor
+    
+    # Apply SDOH modifiers if available
+    if sdoh_data:
+        for domain in domain_scores:
+            sdoh_modifier = calculate_sdoh_modifier(sdoh_data, domain)
+            domain_scores[domain] *= sdoh_modifier
+    
+    # Include network component
+    network_component = 0
+    degree_centrality = network_metrics.get('degree_centrality', 0)
+    betweenness_centrality = network_metrics.get('betweenness_centrality', 0)
+    
+    # Higher centrality = higher connectivity = higher risk
+    network_component = (degree_centrality * 2) + (betweenness_centrality * 3)
+    
+    # Calculate total score using weighted contributions from each domain
+    # These weights reflect the domain's impact on mortality and hospitalization risks
+    domain_weights = {
+        'Cardiometabolic': 1.2,
+        'Immune-Inflammation': 1.1,
+        'Oncological': 1.3,
+        'Neuro-Mental Health': 1.0,
+        'Neurological-Frailty': 1.1,
+        'SDOH': 0.8
+    }
+    
+    # Apply weights and calculate total (ensuring at least 1.0)
+    weighted_domain_scores = {d: domain_scores[d] * domain_weights[d] for d in domain_scores}
+    
+    # The NHCRS calculation with explicit domain weights
+    total_score = calculate_nhcrs_total(weighted_domain_scores)
+    
+    # Add network component (max 2 points)
+    total_score += min(network_component, 2.0)
+    
+    # Calculate risk percentages
+    mortality_risk = calculate_mortality_risk(total_score)
+    hospitalization_risk = calculate_hospitalization_risk(total_score)
+    
+    # Return all results
+    return {
+        'total_score': total_score,
+        'domain_scores': domain_scores,
+        'mortality_risk_10yr': mortality_risk,
+        'hospitalization_risk_5yr': hospitalization_risk
+    }
 
 def calculate_domain_risk_score(conditions: list, domain: str, patient_age: int, patient_gender: str, biomarkers: dict = None, sdoh_data: dict = None) -> float:
     """
@@ -2770,14 +2661,29 @@ def perform_integrated_analysis(icd_df, biomarker_df=None):
         # Initialize result dictionary
         results = {}
         
+        # Ensure patient_id column is properly set for ICD data
+        if icd_df is not None and not icd_df.empty:
+            # Fix column names if needed
+            if 'patient_id' not in icd_df.columns and 'PatId' in icd_df.columns:
+                icd_df['patient_id'] = icd_df['PatId']
+                
+            # Ensure numeric columns are processed properly
+            if 'age' in icd_df.columns:
+                icd_df['age'] = pd.to_numeric(icd_df['age'], errors='coerce').fillna(0)
+        
         # Process diagnosis data if available
         if icd_df is not None and not icd_df.empty:
             logger.info("Processing diagnosis data...")
             icd_results = analyze_comorbidity_data(icd_df, icd_codes)
             results.update(icd_results)
             
+            # Identify diagnosis columns
+            diag_cols = [col for col in icd_df.columns if 'icd' in col.lower() or 'diagnosis' in col.lower() or 'condition' in col.lower()]
+            if not diag_cols:
+                diag_cols = ['icd_code', 'icd_description']
+                
             # Process domain data
-            domain_df = process_domain_data(icd_df, ['icd_code', 'icd_description'])
+            domain_df = process_domain_data(icd_df, diag_cols)
             results['domain_df'] = domain_df
         else:
             logger.info("No diagnosis data provided")
@@ -2786,6 +2692,10 @@ def perform_integrated_analysis(icd_df, biomarker_df=None):
             
         # Process biomarker data if available
         if biomarker_df is not None and not biomarker_df.empty:
+            # Fix column names if needed
+            if 'patient_id' not in biomarker_df.columns and 'PatId' in biomarker_df.columns:
+                biomarker_df['patient_id'] = biomarker_df['PatId']
+                
             logger.info("Processing biomarker data...")
             biomarker_results = analyze_biomarker_data(biomarker_df, biomarker_codes)
             
@@ -2835,10 +2745,10 @@ def perform_integrated_analysis(icd_df, biomarker_df=None):
         
         # Get all unique patient IDs from all data sources
         all_patient_ids = set()
-        if 'domain_df' in results and not results['domain_df'].empty:
-            all_patient_ids.update(results['domain_df']['patient_id'].unique())
-        if 'biomarker_df' in results and not results['biomarker_df'].empty:
-            all_patient_ids.update(results['biomarker_df']['patient_id'].unique())
+        if icd_df is not None and not icd_df.empty:
+            all_patient_ids.update(icd_df['patient_id'].unique())
+        if biomarker_df is not None and not biomarker_df.empty:
+            all_patient_ids.update(biomarker_df['patient_id'].unique())
             
         # Calculate risk scores for each patient
         risk_scores = {}
@@ -2846,32 +2756,49 @@ def perform_integrated_analysis(icd_df, biomarker_df=None):
         mortality_risks = {}
         hospitalization_risks = {}
         
+        logger.info(f"Processing risk scores for {len(all_patient_ids)} patients")
+        
         # Process each patient for risk calculation
         for patient_id in all_patient_ids:
+            # Get patient conditions
             patient_conditions = []
-            patient_demographics = {'age': 0, 'gender': 'Unknown'}
+            if 'domain_df' in results and not results['domain_df'].empty and 'condition' in results['domain_df'].columns:
+                patient_conditions = results['domain_df'][results['domain_df']['patient_id'] == patient_id]['condition'].tolist()
             
-            # Get patient conditions and demographics from domain_df
-            if 'domain_df' in results and not results['domain_df'].empty:
-                patient_df = results['domain_df'][results['domain_df']['patient_id'] == patient_id]
-                if not patient_df.empty:
-                    patient_conditions = patient_df['condition'].tolist()
+            # Get demographics data
+            age = 0
+            gender = 'Unknown'
+            
+            # Try to get demographics from ICD data first
+            if icd_df is not None and not icd_df.empty:
+                patient_rows = icd_df[icd_df['patient_id'] == patient_id]
+                if not patient_rows.empty:
                     # Get demographics from first row
-                    first_row = patient_df.iloc[0]
-                    if 'age' in first_row:
-                        patient_demographics['age'] = first_row['age']
-                    if 'gender' in first_row:
-                        patient_demographics['gender'] = first_row['gender']
+                    if 'age' in patient_rows.columns:
+                        age = patient_rows['age'].iloc[0]
+                        if pd.isna(age):
+                            age = 0
+                    if 'gender' in patient_rows.columns:
+                        gender = patient_rows['gender'].iloc[0]
+                        if pd.isna(gender):
+                            gender = 'Unknown'
             
             # Get biomarker data for this patient
             biomarkers = {}
-            if 'biomarker_df' in results and not results['biomarker_df'].empty:
-                bio_df = results['biomarker_df'][results['biomarker_df']['patient_id'] == patient_id]
-                if not bio_df.empty:
-                    for col in bio_df.columns:
-                        if col != 'patient_id' and not pd.isna(bio_df.iloc[0][col]):
+            if biomarker_df is not None and not biomarker_df.empty:
+                patient_bio = biomarker_df[biomarker_df['patient_id'] == patient_id]
+                if not patient_bio.empty:
+                    for col in biomarker_df.columns:
+                        if col != 'patient_id' and col in patient_bio.columns and not pd.isna(patient_bio[col].iloc[0]):
                             try:
-                                biomarkers[col] = float(bio_df.iloc[0][col])
+                                value = patient_bio[col].iloc[0]
+                                if isinstance(value, str):
+                                    # Try to convert string to number
+                                    try:
+                                        value = float(value.replace(',', ''))
+                                    except:
+                                        continue
+                                biomarkers[col] = float(value)
                             except:
                                 pass
             
@@ -2885,8 +2812,8 @@ def perform_integrated_analysis(icd_df, biomarker_df=None):
             patient_info = {
                 'patient_id': patient_id,
                 'conditions': patient_conditions,
-                'age': patient_demographics['age'],
-                'gender': patient_demographics['gender'],
+                'age': age,
+                'gender': gender,
                 'network_metrics': network_metrics,
                 'biomarkers': biomarkers,
                 'sdoh_data': {}  # Placeholder for SDOH data
@@ -2904,8 +2831,8 @@ def perform_integrated_analysis(icd_df, biomarker_df=None):
             # Create row for combined dataframe
             row = {
                 'patient_id': patient_id,
-                'age': patient_demographics['age'],
-                'gender': patient_demographics['gender'],
+                'age': age,
+                'gender': gender,
                 'condition_count': len(patient_conditions),
                 'total_score': risk_result.get('total_score', 0),
                 'mortality_risk_10yr': risk_result.get('mortality_risk_10yr', 0),
@@ -2915,6 +2842,7 @@ def perform_integrated_analysis(icd_df, biomarker_df=None):
         
         # Create combined dataframe
         combined_df = pd.DataFrame(combined_rows)
+        logger.info(f"Created combined dataframe with {len(combined_rows)} patients")
         
         # Add to results
         results['combined_df'] = combined_df
