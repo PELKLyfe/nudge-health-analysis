@@ -21,7 +21,7 @@ import zipfile
 import io
 import re
 import openai
-from fpdf import FPDF
+from fpdf import FPDF2 as FPDF
 from datetime import datetime
 import time
 
