@@ -890,106 +890,75 @@ def assign_domain_from_text(text):
 
 def analyze_comorbidity_data(icd_df, valid_icd_codes=None):
     """
-    Analyze comorbidity patterns in the ICD data.
-    Returns a tuple of (domain_df, risk_scores_df)
+    Analyze comorbidity patterns in diagnosis data.
+    
+    Args:
+        icd_df: DataFrame containing diagnosis data
+        valid_icd_codes: List of valid ICD-10 codes to check against
+        
+    Returns:
+        Dictionary of analysis results
     """
     try:
-        # Process the data into long format if needed
-        if 'diagnosis' not in icd_df.columns:
-            icd_df = process_diagnosis_data(icd_df)
-            if icd_df.empty:
-                logger.warning("No valid diagnosis data to analyze")
-                return pd.DataFrame(), pd.DataFrame()
-
-        # Get diagnosis columns
-        diag_cols = [col for col in icd_df.columns if 'diagnosis' in col.lower()]
-        
-        # Process data into domains
-        domain_df = process_domain_data(icd_df, diag_cols)
-        
-        # Create network for centrality analysis
-        G = create_domain_network(domain_df)
-        
-        # Calculate network metrics
-        node_centrality = {}
-        if G.number_of_nodes() > 0:
-            degree_cent = nx.degree_centrality(G)
-            betweenness_cent = nx.betweenness_centrality(G)
-            
-            for node in G.nodes():
-                node_centrality[node] = {
-                    'degree_centrality': degree_cent.get(node, 0),
-                    'betweenness_centrality': betweenness_cent.get(node, 0)
-                }
-        
-        # Calculate risk scores for each patient
-        risk_scores = []
-        for patient_id in domain_df['patient_id'].unique():
-            patient_data = domain_df[domain_df['patient_id'] == patient_id].iloc[0]
-            patient_conditions = domain_df[domain_df['patient_id'] == patient_id]['condition'].tolist()
-            
-            # Get network metrics for patient's conditions
-            patient_network_metrics = {
-                'degree_centrality': 0,
-                'betweenness_centrality': 0
+        if icd_df is None or icd_df.empty:
+            return {
+                'domain_counts': {},
+                'network': None,
+                'correlations': None
             }
             
-            if node_centrality:
-                # Average the centrality of all patient conditions
-                condition_centralities = [
-                    node_centrality.get(condition, {'degree_centrality': 0, 'betweenness_centrality': 0})
-                    for condition in patient_conditions
-                    if condition in node_centrality
-                ]
-                
-                if condition_centralities:
-                    patient_network_metrics['degree_centrality'] = np.mean([
-                        c['degree_centrality'] for c in condition_centralities
-                    ])
-                    patient_network_metrics['betweenness_centrality'] = np.mean([
-                        c['betweenness_centrality'] for c in condition_centralities
-                    ])
-            
-            # Create patient info dictionary with all necessary data
-            patient_info = {
-                'patient_id': patient_id,
-                'conditions': patient_conditions,
-                'age': patient_data['age'],
-                'gender': patient_data['gender'],
-                'network_metrics': patient_network_metrics,
-                # SDOH data would be added here if available
-                'sdoh_data': {}
-            }
-            
-            # Calculate risk score using the enhanced NHCRS model
-            risk_score = calculate_total_risk_score(patient_info)
-            risk_scores.append(risk_score)
+        # Process the data into domain format
+        start_time = time.time()
+        domain_df = process_domain_data(icd_df, ['icd_code', 'icd_description'])
+        processing_time = time.time() - start_time
+        logger.info(f"Domain data processing completed in {processing_time:.2f} seconds")
         
-        # Convert risk scores to DataFrame
-        risk_scores_df = pd.DataFrame(risk_scores)
+        # Create domain network - pass both icd_df and domain_df
+        G = create_domain_network(icd_df, domain_df)
         
-        return domain_df, risk_scores_df
+        # Calculate correlations
+        corr_matrix = calculate_condition_correlations(domain_df)
         
+        # Count domains
+        domain_counts = domain_df['domain'].value_counts().to_dict()
+        
+        # Return results
+        return {
+            'domain_counts': domain_counts,
+            'network': G,
+            'correlations': corr_matrix
+        }
+    
     except Exception as e:
         logger.error(f"Error in analyze_comorbidity_data: {str(e)}")
-        return pd.DataFrame(), pd.DataFrame()
+        return {
+            'domain_counts': {},
+            'network': None,
+            'correlations': None
+        }
 
 def analyze_biomarker_data(bio_df, valid_bio_codes):
-    """Analyze biomarker data and return processed results"""
-    try:
-        if bio_df is None or bio_df.empty:
-            return pd.DataFrame()
-            
-        # Process biomarker data
-        processed_df = process_biomarker_data(bio_df)
-        if processed_df.empty:
-            return pd.DataFrame()
-            
-        return processed_df
+    """
+    Analyze biomarker data for patterns and distributions.
+    
+    Args:
+        bio_df: DataFrame with biomarker test results
+        valid_bio_codes: Dictionary of valid biomarker codes and references
         
-    except Exception as e:
-        logger.error(f"Error in analyze_biomarker_data: {str(e)}")
-        return pd.DataFrame()
+    Returns:
+        Dictionary with analysis results
+    """
+    # Process biomarkers
+    domain_df = process_biomarker_data(bio_df)
+    
+    # Create domain network (pass both bio_df and domain_df)
+    G = create_domain_network(bio_df, domain_df)
+    
+    # Return results
+    return {
+        'domain_counts': domain_df['domain'].value_counts().to_dict() if not domain_df.empty else {},
+        'network': G,
+    }
 
 def perform_combined_analysis(domain_df, biomarker_df):
     """
@@ -2782,284 +2751,95 @@ def process_biomarker_data(df):
 
 def perform_integrated_analysis(icd_df, biomarker_df=None):
     """
-    Unified analysis framework that integrates network analysis and risk score calculations.
-    This optimized function combines both analyses to improve performance, following
-    the explicit workflow:
-    
-    1. Load & preprocess patient data (Excel/EHR FHIR)
-    2. Map ICD codes to domains explicitly
-    3. Calculate domain scores with gender/age adjustments
-    4. Calculate NHCRS total score
-    5. Calculate dynamic probabilities (hospitalization/mortality risk)
-    6. Perform network clustering
-    7. Generate clinical recommendations (if OpenAI API key available)
-    8. Generate structured PDF reports
+    Perform integrated analysis of diagnosis and biomarker data.
     
     Args:
-        icd_df: DataFrame containing ICD diagnosis data
-        biomarker_df: Optional DataFrame containing biomarker data
+        icd_df: DataFrame with diagnosis data
+        biomarker_df: DataFrame with biomarker data (optional)
         
     Returns:
-        Dictionary containing all analysis results
+        Dictionary with analysis results
     """
     try:
         start_time = time.time()
-        st.info("Starting integrated analysis...")
-        progress_bar = st.progress(0)
         
-        # 1. PREPROCESS DATA
-        # -------------------
-        # Validate input data
-        if icd_df is None and biomarker_df is None:
-            st.error("No valid data provided for analysis")
-            return None
+        # Get authoritative codes
+        icd_codes = fetch_authoritative_codes()
+        biomarker_codes = fetch_biomarker_reference_data()
         
-        # Process the diagnosis data if available
-        domain_df = None
+        # Initialize result dictionary
+        results = {}
+        
+        # Process diagnosis data if available
         if icd_df is not None and not icd_df.empty:
-            # Process into domains if not already done
-            if 'domain' not in icd_df.columns:
-                # Get diagnosis columns
-                diag_cols = [col for col in icd_df.columns if 'diagnosis' in col.lower() or 'condition' in col.lower()]
-                # Map ICD codes to domains explicitly
-                domain_df = process_domain_data(icd_df, diag_cols)
-            else:
-                domain_df = icd_df.copy()
+            logger.info("Processing diagnosis data...")
+            icd_results = analyze_comorbidity_data(icd_df, icd_codes)
+            results.update(icd_results)
             
-            progress_bar.progress(15)
-        
-        # 2. NETWORK ANALYSIS
-        # ------------------
-        # Network initialization
-        G = None
-        degree_cent = {}
-        betweenness_cent = {}
-        communities = {0: []}
-        network_metrics = {}
-        node_centrality = {}
-        
-        if domain_df is not None and not domain_df.empty:
-            # Create network for centrality analysis
-            G = create_domain_network(domain_df)
-            progress_bar.progress(25)
+            # Process domain data
+            domain_df = process_domain_data(icd_df, ['icd_code', 'icd_description'])
+            results['domain_df'] = domain_df
+        else:
+            logger.info("No diagnosis data provided")
+            domain_df = pd.DataFrame()
+            results['domain_df'] = domain_df
             
-            # Calculate network metrics
-            if G.number_of_nodes() > 0:
-                # Calculate centrality metrics
-                degree_cent = nx.degree_centrality(G)
-                betweenness_cent = nx.betweenness_centrality(G)
-                
-                # Store network-level metrics
-                network_metrics = {
-                    'node_count': G.number_of_nodes(),
-                    'edge_count': G.number_of_edges(),
-                    'density': nx.density(G),
-                    'avg_clustering': nx.average_clustering(G) if G.number_of_nodes() > 2 else 0
-                }
-                
-                # 6. Network clustering explicitly (Louvain method)
-                # ------------------------------------------------
-                try:
-                    if COMMUNITY_DETECTION_AVAILABLE:
-                        partition = community_louvain.best_partition(G)
-                        communities = defaultdict(list)
-                        for node, community_id in partition.items():
-                            communities[community_id].append(node)
-                        network_metrics['communities'] = len(communities)
-                        network_metrics['modularity'] = community_louvain.modularity(partition, G)
-                    else:
-                        communities = {0: list(G.nodes())}
-                        network_metrics['communities'] = 1
-                        network_metrics['modularity'] = 0
-                        st.warning("Community detection library not available. Install python-louvain for better analysis.")
-                except Exception as e:
-                    logger.error(f"Error in community detection: {str(e)}")
-                    communities = {0: list(G.nodes())}
-                    network_metrics['communities'] = 1
-                    network_metrics['modularity'] = 0
-                
-                # Create node metrics dictionary for easy access
-                for node in G.nodes():
-                    node_centrality[node] = {
-                        'degree_centrality': degree_cent.get(node, 0),
-                        'betweenness_centrality': betweenness_cent.get(node, 0),
-                        'domain': assign_clinical_domain(node)
-                    }
-            
-            progress_bar.progress(40)
-        
-        # 3. RISK SCORE CALCULATION
-        # ------------------------
-        # Get patient IDs from available data
-        patient_ids = []
-        if domain_df is not None and not domain_df.empty:
-            patient_ids.extend(domain_df['patient_id'].unique())
+        # Process biomarker data if available
         if biomarker_df is not None and not biomarker_df.empty:
-            patient_ids.extend(biomarker_df['patient_id'].unique())
-        
-        # Remove duplicates and ensure we have patients to analyze
-        patient_ids = list(set(patient_ids))
-        if not patient_ids:
-            st.error("No valid patient IDs found in the data")
-            return None
-        
-        # Prepare results containers
-        patient_results = {}
-        risk_scores = {}
-        domain_scores = {}
-        mortality_risks = {}
-        hospitalization_risks = {}
-        
-        # Track progress for patient calculations
-        total_patients = len(patient_ids)
-        current_progress = 40
-        
-        # Process each patient
-        for i, patient_id in enumerate(patient_ids):
-            # Update progress bar
-            progress_value = current_progress + int(50 * (i / total_patients))
-            progress_bar.progress(progress_value)
+            logger.info("Processing biomarker data...")
+            biomarker_results = analyze_biomarker_data(biomarker_df, biomarker_codes)
             
-            # Get patient conditions if ICD data available
-            patient_conditions = []
-            patient_demographics = {'age': 0, 'gender': 'Unknown'}
+            # Add biomarker results to overall results
+            if 'domain_counts' in results:
+                # Merge domain counts
+                for domain, count in biomarker_results['domain_counts'].items():
+                    results['domain_counts'][domain] = results['domain_counts'].get(domain, 0) + count
+            else:
+                results['domain_counts'] = biomarker_results['domain_counts']
+                
+            # Merge network data
+            if results.get('network') is None:
+                results['network'] = biomarker_results['network']
+            elif biomarker_results['network'] is not None:
+                # Combine networks if both exist
+                combined_network = nx.compose(results['network'], biomarker_results['network'])
+                results['network'] = combined_network
+                
+            # Store biomarker dataframe
+            results['biomarker_df'] = biomarker_df
+                
+            # Perform combined analysis if both data types available
+            if 'domain_df' in results and not domain_df.empty:
+                logger.info("Performing combined analysis...")
+                combined_results = perform_combined_analysis(domain_df, biomarker_df)
+                results.update(combined_results)
+        else:
+            logger.info("No biomarker data provided")
+            results['biomarker_df'] = pd.DataFrame()
             
-            if domain_df is not None and not domain_df.empty:
-                patient_rows = domain_df[domain_df['patient_id'] == patient_id]
-                if not patient_rows.empty:
-                    patient_conditions = patient_rows['condition'].tolist()
-                    # Get demographics from the first row
-                    first_row = patient_rows.iloc[0]
-                    patient_demographics = {
-                        'age': first_row.get('age', 0),
-                        'gender': first_row.get('gender', 'Unknown')
-                    }
+        # Create comprehensive network if both datasets available
+        if 'domain_df' in results and 'biomarker_df' in results and not domain_df.empty:
+            # Combine ICD and biomarker data for network
+            combined_df = pd.concat([
+                domain_df[['patient_id', 'condition', 'domain']],
+                results.get('biomarker_domains', pd.DataFrame())
+            ], ignore_index=True)
             
-            # Extract biomarker values if available
-            biomarkers = {}
-            if biomarker_df is not None and not biomarker_df.empty:
-                patient_bio_rows = biomarker_df[biomarker_df['patient_id'] == patient_id]
-                if not patient_bio_rows.empty:
-                    patient_bio_row = patient_bio_rows.iloc[0]
-                    for col in biomarker_df.columns:
-                        if col != 'patient_id' and not pd.isna(patient_bio_row[col]):
-                            try:
-                                biomarkers[col] = float(patient_bio_row[col])
-                            except:
-                                pass
+            # Create network from combined data
+            G = create_domain_network(combined_df, combined_df)
+            results['network'] = G
             
-            # Calculate network-based metrics for this patient
-            network_metrics_patient = {
-                'degree_centrality': 0,
-                'betweenness_centrality': 0
-            }
-            
-            if G is not None and G.number_of_nodes() > 0:
-                # Average the centrality of all patient conditions
-                valid_conditions = [c for c in patient_conditions if c in G.nodes()]
-                if valid_conditions:
-                    network_metrics_patient['degree_centrality'] = np.mean([
-                        degree_cent.get(c, 0) for c in valid_conditions
-                    ])
-                    network_metrics_patient['betweenness_centrality'] = np.mean([
-                        betweenness_cent.get(c, 0) for c in valid_conditions
-                    ])
-            
-            # 2. Map ICD codes to domains explicitly
-            # -------------------------------------
-            # Count conditions by domain for this patient
-            domain_condition_counts = {}
-            if patient_conditions:
-                # Group conditions by domain
-                for condition in patient_conditions:
-                    domain = assign_clinical_domain(condition)
-                    if domain not in domain_condition_counts:
-                        domain_condition_counts[domain] = 0
-                    domain_condition_counts[domain] += 1
-            
-            # Prepare patient data for risk calculation
-            patient_info = {
-                'patient_id': patient_id,
-                'conditions': patient_conditions,
-                'age': patient_demographics.get('age', 0),
-                'gender': patient_demographics.get('gender', 'Unknown'),
-                'network_metrics': network_metrics_patient,
-                'biomarkers': biomarkers,
-                'sdoh_data': {},  # Placeholder for SDOH data
-                'domain_condition_counts': domain_condition_counts
-            }
-            
-            # 3 & 4. Calculate domain scores and NHCRS total with gender/age adjustments
-            # -------------------------------------------------------------------------
-            risk_result = calculate_total_risk_score(patient_info)
-            
-            # Store results
-            patient_results[patient_id] = patient_info
-            risk_scores[patient_id] = risk_result.get('total_score', 0)
-            domain_scores[patient_id] = risk_result.get('domain_scores', {})
-            
-            # 5. Calculate dynamic probabilities (hospitalization/mortality risk)
-            # -----------------------------------------------------------------
-            mortality_risks[patient_id] = risk_result.get('mortality_risk_10yr', 0)
-            hospitalization_risks[patient_id] = risk_result.get('hospitalization_risk_5yr', 0)
-        
-        progress_bar.progress(90)
-        
-        # Calculate domain distribution across all patients
-        all_domains = []
-        for patient_id in domain_scores:
-            all_domains.extend(domain_scores[patient_id].keys())
-        domain_counts = dict(Counter(all_domains))
-        
-        # Prepare combined patient dataframe
-        combined_rows = []
-        for patient_id in patient_results:
-            patient_data = patient_results[patient_id]
-            row = {
-                'patient_id': patient_id,
-                'age': patient_data.get('age', 0),
-                'gender': patient_data.get('gender', 'Unknown'),
-                'conditions': patient_data.get('conditions', []),
-                'condition_count': len(patient_data.get('conditions', [])),
-                'domain_scores': domain_scores.get(patient_id, {}),
-                'total_score': risk_scores.get(patient_id, 0),
-                'mortality_risk_10yr': mortality_risks.get(patient_id, 0),
-                'hospitalization_risk_5yr': hospitalization_risks.get(patient_id, 0),
-                'degree_centrality': patient_data.get('network_metrics', {}).get('degree_centrality', 0),
-                'betweenness_centrality': patient_data.get('network_metrics', {}).get('betweenness_centrality', 0)
-            }
-            combined_rows.append(row)
-        
-        combined_df = pd.DataFrame(combined_rows)
-        
-        # Complete progress
-        progress_bar.progress(100)
-        
-        # Log performance
-        end_time = time.time()
-        analysis_time = end_time - start_time
+        # Calculate total analysis time
+        analysis_time = time.time() - start_time
         logger.info(f"Integrated analysis completed in {analysis_time:.2f} seconds")
+        results['analysis_time'] = analysis_time
         
-        # Return combined results
-        return {
-            'G': G,
-            'domain_df': domain_df,
-            'combined_df': combined_df,
-            'network_metrics': network_metrics,
-            'patient_results': patient_results,
-            'risk_scores': risk_scores,
-            'domain_scores': domain_scores,
-            'mortality_risks': mortality_risks,
-            'hospitalization_risks': hospitalization_risks,
-            'domain_counts': domain_counts,
-            'communities': communities if 'communities' in locals() else {0: list(G.nodes()) if G else []},
-            'node_centrality': node_centrality
-        }
-            
+        return results
+        
     except Exception as e:
-        logger.error(f"Error in integrated analysis: {str(e)}")
-        st.error(f"Error in analysis: {str(e)}")
-        return None
+        logger.error(f"Error in perform_integrated_analysis: {str(e)}")
+        traceback.print_exc()
+        return {'error': str(e)}
 
 def main():
     # Set up the sidebar
