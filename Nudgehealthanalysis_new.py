@@ -1978,12 +1978,13 @@ def get_gender_age_factor(gender, age, domain):
 def calculate_biological_age(chronological_age, conditions, biomarkers):
     """
     Calculate a simplified biological age based on chronological age, conditions, and biomarkers.
-    Uses the Phenotypic Age concept from NHANES (Levine et al.)
+    Uses the Phenotypic Age concept from NHANES (Levine et al.) with logarithmic scaling
+    and enhanced biomarker handling.
     
     Args:
         chronological_age: Chronological age in years
         conditions: List of medical conditions
-        biomarkers: Dictionary of biomarker values
+        biomarkers: Dictionary of biomarker values (can include imputed values)
         
     Returns:
         Estimated biological age in years
@@ -1991,64 +1992,96 @@ def calculate_biological_age(chronological_age, conditions, biomarkers):
     # Initialize with chronological age
     biological_age = chronological_age
     
-    # Add years based on condition count (simplified)
+    # Add years based on condition count with logarithmic scaling
     condition_count = len(conditions) if conditions else 0
     if condition_count > 0:
-        # Each condition adds 0.5 to 1.5 years depending on count
-        biological_age += min(condition_count * 0.75, 7.5)
+        # Logarithmic scaling: heavier impact for first few conditions
+        biological_age += min(10, 3 * math.log1p(condition_count))
     
     # Add/subtract years based on key biomarkers if available
     if biomarkers:
+        biomarker_age_impact = 0
+        
         # Glycemic status (HbA1c or glucose)
         if 'hba1c' in biomarkers:
             hba1c = float(biomarkers['hba1c'])
             if hba1c >= 6.5:  # Diabetes range
-                biological_age += 5
+                biomarker_age_impact += 5 * math.log1p((hba1c - 5.7) / 1.3)  # Logarithmic impact
             elif hba1c >= 5.7:  # Prediabetes range
-                biological_age += 2
+                biomarker_age_impact += 2 * math.log1p((hba1c - 5.0) / 1.7)  # Logarithmic impact
             elif hba1c < 5.0:  # Very low end
-                biological_age -= 1
+                biomarker_age_impact -= 1
         elif 'glucose' in biomarkers:
             glucose = float(biomarkers['glucose'])
             if glucose >= 126:  # Diabetes range
-                biological_age += 4
+                biomarker_age_impact += 4 * math.log1p((glucose - 100) / 50)  # Logarithmic impact
             elif glucose >= 100:  # Prediabetes range
-                biological_age += 2
+                biomarker_age_impact += 2 * math.log1p((glucose - 90) / 30)  # Logarithmic impact
             
-        # Inflammation (CRP)
-        if 'crp' in biomarkers or 'hs_crp' in biomarkers:
-            crp_value = float(biomarkers.get('crp', biomarkers.get('hs_crp', 0)))
+        # Inflammation (CRP) - strong predictor of biological aging
+        if 'crp' in biomarkers:
+            crp_value = float(biomarkers['crp'])
             if crp_value >= 3.0:  # High inflammation
-                biological_age += 3
+                biomarker_age_impact += 3 * math.log1p(crp_value / 1.5)  # Logarithmic impact
             elif crp_value >= 1.0:  # Moderate inflammation
-                biological_age += 1
+                biomarker_age_impact += 1 * math.log1p(crp_value)
+        elif 'hs_crp' in biomarkers:
+            crp_value = float(biomarkers['hs_crp'])
+            if crp_value >= 3.0:
+                biomarker_age_impact += 3 * math.log1p(crp_value / 1.5)
+            elif crp_value >= 1.0:
+                biomarker_age_impact += 1 * math.log1p(crp_value)
                 
-        # Kidney function
+        # Kidney function - key component of phenotypic age
         if 'creatinine' in biomarkers:
             creatinine = float(biomarkers['creatinine'])
+            normal_range = 1.3 if 'gender' in biomarkers and biomarkers.get('gender', '').lower() in ['m', 'male', 'man'] else 1.1
             if creatinine >= 1.5:  # Kidney impairment
-                biological_age += 3
+                biomarker_age_impact += 3 * math.log1p((creatinine - normal_range) / normal_range)
         elif 'egfr' in biomarkers:
             egfr = float(biomarkers['egfr'])
             if egfr < 60:  # CKD stage 3+
-                biological_age += 3
+                biomarker_age_impact += 3 * math.log1p((90 - egfr) / 30)
             elif egfr < 90:  # Mild kidney dysfunction
-                biological_age += 1
+                biomarker_age_impact += 1 * math.log1p((90 - egfr) / 30)
                 
-        # Cardiovascular (cholesterol)
-        if 'ldl_cholesterol' in biomarkers:
-            ldl = float(biomarkers['ldl_cholesterol'])
+        # Cardiovascular (cholesterol) - validated predictor in NHANES
+        if 'ldl_cholesterol' in biomarkers or 'ldl' in biomarkers:
+            ldl = float(biomarkers.get('ldl_cholesterol', biomarkers.get('ldl', 0)))
             if ldl >= 160:
-                biological_age += 2
+                biomarker_age_impact += 2 * math.log1p((ldl - 130) / 50)
             elif ldl >= 130:
-                biological_age += 1
+                biomarker_age_impact += 1 * math.log1p((ldl - 100) / 50)
                 
-        if 'hdl_cholesterol' in biomarkers:
-            hdl = float(biomarkers['hdl_cholesterol'])
+        if 'hdl_cholesterol' in biomarkers or 'hdl' in biomarkers:
+            hdl = float(biomarkers.get('hdl_cholesterol', biomarkers.get('hdl', 0)))
             if hdl >= 60:  # Protective effect
-                biological_age -= 1
+                biomarker_age_impact -= 1 * math.log1p((hdl - 40) / 30)
             elif hdl < 40:  # Risk factor
-                biological_age += 1
+                biomarker_age_impact += 1 * math.log1p((40 - hdl) / 20)
+        
+        # CBC components - part of phenotypic age algorithm
+        if 'wbc' in biomarkers:
+            wbc = float(biomarkers['wbc'])
+            if wbc > 10:  # Elevated
+                biomarker_age_impact += 1.5 * math.log1p((wbc - 7.5) / 5)
+            elif wbc < 4:  # Low
+                biomarker_age_impact += 1 * math.log1p((4 - wbc) / 2)
+                
+        if 'hemoglobin' in biomarkers:
+            hemoglobin = float(biomarkers['hemoglobin'])
+            female_range = 'gender' in biomarkers and biomarkers.get('gender', '').lower() in ['f', 'female', 'woman']
+            normal_low = 12 if female_range else 13.5
+            if hemoglobin < normal_low:  # Anemia
+                biomarker_age_impact += 2 * math.log1p((normal_low - hemoglobin) / 3)
+                
+        if 'albumin' in biomarkers:
+            albumin = float(biomarkers['albumin'])
+            if albumin < 3.5:  # Hypoalbuminemia - strong predictor of frailty
+                biomarker_age_impact += 3 * math.log1p((3.5 - albumin) / 1)
+                
+        # Add biomarker impact to biological age
+        biological_age += biomarker_age_impact
                 
     # Cap the biological age to reasonable bounds
     biological_age = max(chronological_age - 15, biological_age)
@@ -2288,6 +2321,7 @@ def calculate_total_risk_score(patient_info):
     Calculate a comprehensive risk score based on multiple health domains.
     Uses validated Cox regression coefficients from NHANES and UK Biobank for 
     5-year hospitalization and 10-year mortality risk.
+    Implements logarithmic scaling and improved missing data handling.
     
     Args:
         patient_info: Dictionary containing patient data including:
@@ -2343,88 +2377,123 @@ def calculate_total_risk_score(patient_info):
         domain = assign_clinical_domain(condition)
         domain_counts[domain] = domain_counts.get(domain, 0) + 1
     
-    # Calculate domain scores with a more sensitive formula
-    total_conditions = len(conditions)
+    # Calculate domain scores using logarithmic scaling
+    # Log scaling gives more weight to first few conditions but doesn't cap linearly
     for domain, count in domain_counts.items():
-        # Calculate domain-specific risk score (0-10 scale)
-        # Enhanced formula to increase sensitivity for higher condition counts
-        # Square root scaling gives more weight to first few conditions
         if domain in domain_scores:
-            # Enhanced formula: more rapid increase for first few conditions, then levels off
-            domain_scores[domain] = min(10, math.sqrt(count) * 3.5)
+            # Logarithmic scaling: 1 condition → 2 points, 4 conditions → 4 points, 9 conditions → 6 points
+            domain_scores[domain] = min(10, 2 * math.log2(count + 1))
     
-    # Enhance domain scores with biomarker data
-    if biomarkers:
-        # Parse biomarkers by domain
-        for marker, value in biomarkers.items():
+    # Enhanced biomarker processing with missing value imputation
+    enhanced_biomarkers = {}
+    
+    # Pre-process biomarkers with imputation for missing values
+    key_biomarkers = ['glucose', 'hba1c', 'ldl', 'hdl', 'triglycerides', 'crp', 
+                      'albumin', 'hemoglobin', 'wbc', 'vitamin_d', 'egfr', 'creatinine']
+    
+    for marker in key_biomarkers:
+        # Check if biomarker exists
+        value = None
+        for key, val in biomarkers.items():
+            if marker in key.lower().replace('-', '_').replace(' ', '_'):
+                try:
+                    value = float(val)
+                    break
+                except (ValueError, TypeError):
+                    pass
+                
+        # If value is missing, use NHANES reference value for imputation
+        if value is None:
+            value = get_reference_value(marker, gender, age)
+            if value is not None:
+                enhanced_biomarkers[marker] = value
+        else:
+            enhanced_biomarkers[marker] = value
+    
+    # Merge enhanced biomarkers with original ones
+    for marker, value in biomarkers.items():
+        if marker not in enhanced_biomarkers:
             try:
-                value_float = float(value)
+                enhanced_biomarkers[marker] = float(value)
+            except (ValueError, TypeError):
+                pass
+    
+    # Enhance domain scores with biomarker data using logarithmic scaling
+    if enhanced_biomarkers:
+        # Parse biomarkers by domain
+        for marker, value in enhanced_biomarkers.items():
+            try:
+                marker_lower = marker.lower()
+                
                 # Cardiometabolic biomarkers
-                if marker.lower() in ['glucose', 'hba1c', 'a1c']:
-                    # Diabetes markers
-                    if (marker.lower() == 'glucose' and value_float >= 126) or \
-                       (marker.lower() in ['hba1c', 'a1c'] and value_float >= 6.5):
-                        # Diabetic range
-                        domain_scores['Cardiometabolic'] += 2
-                    elif (marker.lower() == 'glucose' and value_float >= 100) or \
-                         (marker.lower() in ['hba1c', 'a1c'] and value_float >= 5.7):
+                if marker_lower in ['glucose', 'hba1c', 'a1c']:
+                    # Diabetes markers with logarithmic scaling
+                    if (marker_lower == 'glucose' and value >= 126) or \
+                       (marker_lower in ['hba1c', 'a1c'] and value >= 6.5):
+                        # Diabetic range - more severe
+                        domain_scores['Cardiometabolic'] += 2 * math.log1p(value / 100)
+                    elif (marker_lower == 'glucose' and value >= 100) or \
+                         (marker_lower in ['hba1c', 'a1c'] and value >= 5.7):
                         # Pre-diabetic range
-                        domain_scores['Cardiometabolic'] += 1
+                        domain_scores['Cardiometabolic'] += math.log1p(value / 100)
                         
-                elif marker.lower() in ['ldl', 'ldl_cholesterol', 'ldl-c']:
-                    # LDL cholesterol
-                    if value_float >= 160:
-                        domain_scores['Cardiometabolic'] += 1.5
-                    elif value_float >= 130:
-                        domain_scores['Cardiometabolic'] += 0.8
+                elif marker_lower in ['ldl', 'ldl_cholesterol', 'ldl-c']:
+                    # LDL cholesterol with logarithmic scaling
+                    if value >= 130:
+                        severity = (value - 100) / 60  # Normalized severity (130-190 range)
+                        domain_scores['Cardiometabolic'] += 0.8 * math.log1p(1 + severity)
                         
-                elif marker.lower() in ['hdl', 'hdl_cholesterol', 'hdl-c']:
-                    # HDL cholesterol (protective if high)
-                    if value_float < 40:
-                        domain_scores['Cardiometabolic'] += 1
+                elif marker_lower in ['hdl', 'hdl_cholesterol', 'hdl-c']:
+                    # HDL cholesterol (protective if high) - inverse logarithmic scaling
+                    if value < 40:
+                        severity = (40 - value) / 40  # Normalized severity for low HDL
+                        domain_scores['Cardiometabolic'] += 0.8 * math.log1p(1 + severity)
                         
-                elif marker.lower() in ['triglycerides']:
-                    # Triglycerides
-                    if value_float >= 200:
-                        domain_scores['Cardiometabolic'] += 1
+                elif marker_lower in ['triglycerides']:
+                    # Triglycerides with logarithmic scaling
+                    if value >= 150:
+                        severity = (value - 150) / 350  # Normalized severity (150-500 range)
+                        domain_scores['Cardiometabolic'] += 0.8 * math.log1p(1 + severity)
                 
                 # Inflammatory biomarkers
-                elif marker.lower() in ['crp', 'hs_crp', 'hs-crp']:
-                    # C-reactive protein
-                    if value_float >= 3:
-                        domain_scores['Immune-Inflammation'] += 2
-                    elif value_float >= 1:
-                        domain_scores['Immune-Inflammation'] += 1
+                elif marker_lower in ['crp', 'hs_crp', 'hs-crp']:
+                    # C-reactive protein with logarithmic scaling
+                    if value >= 1:
+                        # Log scaling gives progressively higher scores for higher values
+                        domain_scores['Immune-Inflammation'] += min(3, math.log1p(value))
                         
-                elif marker.lower() in ['esr']:
-                    # Erythrocyte sedimentation rate
-                    if value_float >= 30:
-                        domain_scores['Immune-Inflammation'] += 1.5
+                elif marker_lower in ['esr']:
+                    # Erythrocyte sedimentation rate with logarithmic scaling
+                    if value >= 20:
+                        domain_scores['Immune-Inflammation'] += 0.7 * math.log1p(value / 20)
                         
                 # Neurological/Frailty biomarkers
-                elif marker.lower() in ['vitamin_d', 'vitamin d', '25-oh d']:
-                    # Vitamin D (low levels associated with frailty)
-                    if value_float < 20:
-                        domain_scores['Neurological-Frailty'] += 1
+                elif marker_lower in ['vitamin_d', 'vitamin d', '25-oh d']:
+                    # Vitamin D (low levels associated with frailty) - inverse logarithmic scaling
+                    if value < 30:
+                        severity = (30 - value) / 30  # Normalized severity for low vitamin D
+                        domain_scores['Neurological-Frailty'] += 0.7 * math.log1p(1 + severity)
                 
                 # Kidney function biomarkers
-                elif marker.lower() in ['creatinine']:
-                    # Creatinine
-                    if value_float >= 1.5:
-                        domain_scores['Cardiometabolic'] += 1.5
+                elif marker_lower in ['creatinine']:
+                    # Creatinine with logarithmic scaling
+                    normal_range = 1.3 if gender.lower() in ['m', 'male', 'man'] else 1.1
+                    if value > normal_range:
+                        severity = (value - normal_range) / normal_range
+                        domain_scores['Cardiometabolic'] += 0.9 * math.log1p(1 + severity)
                         
-                elif marker.lower() in ['egfr']:
-                    # eGFR
-                    if value_float < 60:
-                        domain_scores['Cardiometabolic'] += 1.5
-                    elif value_float < 90:
-                        domain_scores['Cardiometabolic'] += 0.7
+                elif marker_lower in ['egfr']:
+                    # eGFR with inverse logarithmic scaling
+                    if value < 90:
+                        severity = (90 - value) / 90  # Normalized severity for low eGFR
+                        domain_scores['Cardiometabolic'] += 0.8 * math.log1p(1 + severity)
                         
                 # Cancer biomarkers
-                elif marker.lower() in ['psa']:
-                    # PSA (for men)
-                    if gender.lower() in ['m', 'male', 'man'] and value_float >= 4:
-                        domain_scores['Oncological'] += 2
+                elif marker_lower in ['psa']:
+                    # PSA (for men) with logarithmic scaling
+                    if gender.lower() in ['m', 'male', 'man'] and value >= 4:
+                        severity = (value - 4) / 6  # Normalized severity (4-10 range)
+                        domain_scores['Oncological'] += 1.5 * math.log1p(1 + severity)
                 
             except (ValueError, TypeError):
                 # Skip non-numeric values
@@ -2436,16 +2505,19 @@ def calculate_total_risk_score(patient_info):
             factor = get_gender_age_factor(gender, age, domain)
             domain_scores[domain] *= factor
     
-    # Cap domain scores at 10
+    # Apply logarithmic cap rather than linear cap
     for domain in domain_scores:
-        domain_scores[domain] = min(10, domain_scores[domain])
+        if domain_scores[domain] > 10:
+            # Logarithmic soft cap: values above 10 increase more slowly
+            domain_scores[domain] = 10 + math.log1p(domain_scores[domain] - 10)
     
-    # Factor in SDOH data if available
+    # Factor in SDOH data if available with logarithmic scaling
     if sdoh_data:
-        # Calculate SDOH score (0-10 scale)
+        # Calculate SDOH score with logarithmic scaling
         sdoh_values = list(sdoh_data.values())
         if sdoh_values:
-            domain_scores['SDOH'] = min(10, sum(sdoh_values) * 10)
+            raw_score = sum(sdoh_values)
+            domain_scores['SDOH'] = min(10, 5 * math.log1p(raw_score))
     
     # Calculate total risk score with domain weights
     # Weights based on relative impact on mortality/hospitalization in NHANES/UKB
@@ -2458,10 +2530,11 @@ def calculate_total_risk_score(patient_info):
         'SDOH': 0.05
     }
     
-    # Apply weights to domain scores
+    # Apply weights to domain scores with gender-specific adjustments
     weighted_domain_scores = {}
     for domain, score in domain_scores.items():
-        weighted_domain_scores[domain] = score * domain_weights.get(domain, 0)
+        gender_factor = get_gender_age_factor(gender, age, domain)
+        weighted_domain_scores[domain] = score * domain_weights.get(domain, 0) * gender_factor
     
     # Calculate weighted sum for total score
     total_score = sum(weighted_domain_scores.values())
@@ -2472,39 +2545,44 @@ def calculate_total_risk_score(patient_info):
         degree_cent = network_metrics.get('degree_centrality', 0)
         betweenness_cent = network_metrics.get('betweenness_centrality', 0)
         
-        # Higher centrality = higher risk
+        # Higher centrality = higher risk with logarithmic scaling
         network_component = (degree_cent * 5) + (betweenness_cent * 3)
-        network_component = min(2, network_component)  # Cap at +2 points
+        network_component = min(2, math.log1p(network_component))  # Logarithmic cap
         
     # Add network component to total score
     total_score += network_component
     
-    # Determine risk level
-    risk_level = 'Low'
-    if total_score >= 7:
+    # Determine risk level with more granular categories
+    if total_score >= 8:
+        risk_level = 'Very High'
+    elif total_score >= 6:
         risk_level = 'High'
     elif total_score >= 4:
         risk_level = 'Moderate'
+    elif total_score >= 2:
+        risk_level = 'Low'
+    else:
+        risk_level = 'Very Low'
     
     # Calculate biological age
-    biological_age = calculate_biological_age(age, conditions, biomarkers)
+    biological_age = calculate_biological_age(age, conditions, enhanced_biomarkers)
     
-    # Calculate 10-year mortality risk
+    # Calculate 10-year mortality risk with enhanced biomarkers
     mortality_risk = calculate_mortality_risk(
         age=age,
         gender=gender,
         domain_scores=domain_scores,
         health_factors={'sdoh_data': sdoh_data, 'biological_age': biological_age},
-        biomarkers=biomarkers
+        biomarkers=enhanced_biomarkers
     )
     
-    # Calculate 5-year hospitalization risk
+    # Calculate 5-year hospitalization risk with enhanced biomarkers
     hospitalization_risk = calculate_hospitalization_risk(
         age=age,
         gender=gender,
         domain_scores=domain_scores,
         health_factors={'sdoh_data': sdoh_data, 'biological_age': biological_age},
-        biomarkers=biomarkers
+        biomarkers=enhanced_biomarkers
     )
     
     # Return comprehensive risk assessment
@@ -2514,12 +2592,81 @@ def calculate_total_risk_score(patient_info):
         'domain_scores': {k: round(v, 2) for k, v in domain_scores.items()},
         'weighted_domain_scores': {k: round(v, 2) for k, v in weighted_domain_scores.items()},
         'domain_counts': domain_counts,
+        'enhanced_biomarkers': len(enhanced_biomarkers) - len(biomarkers),  # Count of imputed biomarkers
         'network_component': network_component,
         'biological_age': biological_age,
         'risk_level': risk_level,
         'mortality_risk_10yr': mortality_risk,
         'hospitalization_risk_5yr': hospitalization_risk
     }
+
+# Add after imports (around line 22)
+# Add NHANES reference means for missing data imputation
+NHANES_REFERENCE_VALUES = {
+    # Reference biomarker means from NHANES for imputation of missing values
+    # Values stratified by sex and age group (general adult population)
+    'glucose': {'male': 100.0, 'female': 98.0},
+    'hba1c': {'male': 5.6, 'female': 5.5},
+    'ldl': {'male': 115.0, 'female': 118.0},
+    'hdl': {'male': 47.0, 'female': 58.0},
+    'triglycerides': {'male': 123.0, 'female': 110.0},
+    'crp': {'male': 0.8, 'female': 1.0},
+    'albumin': {'male': 4.3, 'female': 4.2},
+    'alt': {'male': 28.0, 'female': 21.0},
+    'ast': {'male': 25.0, 'female': 21.0},
+    'bun': {'male': 15.0, 'female': 13.0},
+    'creatinine': {'male': 1.0, 'female': 0.8},
+    'egfr': {'male': 95.0, 'female': 97.0},
+    'hemoglobin': {'male': 15.0, 'female': 13.5},
+    'wbc': {'male': 6.8, 'female': 6.5},
+    'vitamin_d': {'male': 24.0, 'female': 26.0},
+    # Age-specific means can be added as needed
+}
+
+def get_reference_value(biomarker, gender, age=None):
+    """
+    Get reference value for a biomarker based on NHANES data.
+    Used for imputation when biomarker data is missing.
+    
+    Args:
+        biomarker: Biomarker name (string)
+        gender: Patient gender (string)
+        age: Patient age (optional)
+        
+    Returns:
+        Reference value as float
+    """
+    # Normalize biomarker name and gender
+    biomarker_norm = biomarker.lower().replace('-', '_').replace(' ', '_')
+    gender_norm = 'female' if gender and str(gender).lower() in ['f', 'female', 'woman'] else 'male'
+    
+    # If biomarker exists in reference data
+    if biomarker_norm in NHANES_REFERENCE_VALUES:
+        values = NHANES_REFERENCE_VALUES[biomarker_norm]
+        
+        # Return gender-specific value if available
+        if isinstance(values, dict) and gender_norm in values:
+            return values[gender_norm]
+        # Otherwise return general value
+        elif isinstance(values, (int, float)):
+            return values
+    
+    # Default reference values for common biomarkers if not found
+    default_values = {
+        'cholesterol': 190.0,
+        'tsh': 2.5,
+        'psa': 1.5 if gender_norm == 'male' else 0,
+        'esr': 15.0,
+        'platelets': 250.0,
+        'inr': 1.0
+    }
+    
+    for key, value in default_values.items():
+        if key in biomarker_norm:
+            return value
+    
+    # Return None if no reference value is found
+    return None
 
 if __name__ == "__main__":
     main() 
