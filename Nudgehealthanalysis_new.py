@@ -2865,13 +2865,13 @@ def generate_pdf_report(patient_data, risk_scores, recommendations=None):
                 else:
                     pdf.multi_cell(0, 5, line)
             
-        # Footer
-        pdf.set_y(-15)
-        pdf.set_font('Arial', 'I', 8)
-        pdf.cell(0, 10, f"Nudge Health AI Analysis - Page {pdf.page_no()}/{{nb}}", 0, 0, 'C')
+        # Add footer with copyright
+        pdf.ln(20)
+        pdf.set_font("Arial", "I", 8)
+        pdf.cell(0, 10, "© 2025 Nudge Health AI. All rights reserved.", ln=True, align='C')
         
         # Return the PDF as bytes
-        return pdf.output(dest='S').encode('latin1')
+        return pdf.output(dest='S').encode('latin-1')
         
     except Exception as e:
         logger.error(f"Error generating PDF report: {str(e)}")
@@ -2882,7 +2882,7 @@ def generate_pdf_report(patient_data, risk_scores, recommendations=None):
         pdf.cell(0, 10, "Error Generating Report", 0, 1, 'C')
         pdf.set_font('Arial', '', 12)
         pdf.cell(0, 10, f"An error occurred: {str(e)}", 0, 1, 'L')
-        return pdf.output(dest='S').encode('latin1')
+        return pdf.output(dest='S').encode('latin-1')
 
 # Display patient risk scores in a formatted way
 def display_patient_risk_scores(patient_data, risk_scores):
