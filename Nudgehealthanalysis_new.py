@@ -2828,7 +2828,101 @@ def perform_integrated_analysis(icd_df, biomarker_df=None):
             # Create network from combined data
             G = create_domain_network(combined_df, combined_df)
             results['network'] = G
+        
+        # Now create the combined patient dataframe for compatibility with main function
+        # This is needed for the metrics in the UI
+        combined_rows = []
+        
+        # Get all unique patient IDs from all data sources
+        all_patient_ids = set()
+        if 'domain_df' in results and not results['domain_df'].empty:
+            all_patient_ids.update(results['domain_df']['patient_id'].unique())
+        if 'biomarker_df' in results and not results['biomarker_df'].empty:
+            all_patient_ids.update(results['biomarker_df']['patient_id'].unique())
             
+        # Calculate risk scores for each patient
+        risk_scores = {}
+        domain_scores = {}
+        mortality_risks = {}
+        hospitalization_risks = {}
+        
+        # Process each patient for risk calculation
+        for patient_id in all_patient_ids:
+            patient_conditions = []
+            patient_demographics = {'age': 0, 'gender': 'Unknown'}
+            
+            # Get patient conditions and demographics from domain_df
+            if 'domain_df' in results and not results['domain_df'].empty:
+                patient_df = results['domain_df'][results['domain_df']['patient_id'] == patient_id]
+                if not patient_df.empty:
+                    patient_conditions = patient_df['condition'].tolist()
+                    # Get demographics from first row
+                    first_row = patient_df.iloc[0]
+                    if 'age' in first_row:
+                        patient_demographics['age'] = first_row['age']
+                    if 'gender' in first_row:
+                        patient_demographics['gender'] = first_row['gender']
+            
+            # Get biomarker data for this patient
+            biomarkers = {}
+            if 'biomarker_df' in results and not results['biomarker_df'].empty:
+                bio_df = results['biomarker_df'][results['biomarker_df']['patient_id'] == patient_id]
+                if not bio_df.empty:
+                    for col in bio_df.columns:
+                        if col != 'patient_id' and not pd.isna(bio_df.iloc[0][col]):
+                            try:
+                                biomarkers[col] = float(bio_df.iloc[0][col])
+                            except:
+                                pass
+            
+            # Calculate network metrics for this patient
+            network_metrics = {
+                'degree_centrality': 0,
+                'betweenness_centrality': 0
+            }
+            
+            # Prepare patient info for risk calculation
+            patient_info = {
+                'patient_id': patient_id,
+                'conditions': patient_conditions,
+                'age': patient_demographics['age'],
+                'gender': patient_demographics['gender'],
+                'network_metrics': network_metrics,
+                'biomarkers': biomarkers,
+                'sdoh_data': {}  # Placeholder for SDOH data
+            }
+            
+            # Calculate risk score
+            risk_result = calculate_total_risk_score(patient_info)
+            
+            # Store results
+            risk_scores[patient_id] = risk_result.get('total_score', 0)
+            domain_scores[patient_id] = risk_result.get('domain_scores', {})
+            mortality_risks[patient_id] = risk_result.get('mortality_risk_10yr', 0)
+            hospitalization_risks[patient_id] = risk_result.get('hospitalization_risk_5yr', 0)
+            
+            # Create row for combined dataframe
+            row = {
+                'patient_id': patient_id,
+                'age': patient_demographics['age'],
+                'gender': patient_demographics['gender'],
+                'condition_count': len(patient_conditions),
+                'total_score': risk_result.get('total_score', 0),
+                'mortality_risk_10yr': risk_result.get('mortality_risk_10yr', 0),
+                'hospitalization_risk_5yr': risk_result.get('hospitalization_risk_5yr', 0)
+            }
+            combined_rows.append(row)
+        
+        # Create combined dataframe
+        combined_df = pd.DataFrame(combined_rows)
+        
+        # Add to results
+        results['combined_df'] = combined_df
+        results['risk_scores'] = risk_scores
+        results['domain_scores'] = domain_scores
+        results['mortality_risks'] = mortality_risks
+        results['hospitalization_risks'] = hospitalization_risks
+        
         # Calculate total analysis time
         analysis_time = time.time() - start_time
         logger.info(f"Integrated analysis completed in {analysis_time:.2f} seconds")
@@ -3010,28 +3104,31 @@ def main():
                     with tabs[0]:  # Overview tab
                         st.subheader("Analysis Overview")
                         combined_df = analysis_results.get('combined_df')
-                        risk_scores = analysis_results.get('risk_scores')
-                        domain_counts = analysis_results.get('domain_counts')
-                        mortality_risks = analysis_results.get('mortality_risks')
+                        risk_scores = analysis_results.get('risk_scores', {})
+                        domain_counts = analysis_results.get('domain_counts', {})
+                        mortality_risks = analysis_results.get('mortality_risks', {})
                         
                         # Metrics overview
                         col1, col2, col3, col4 = st.columns(4)
                         with col1:
-                            st.metric("Total Patients", combined_df['patient_id'].nunique())
+                            if combined_df is not None and not combined_df.empty:
+                                st.metric("Total Patients", combined_df['patient_id'].nunique())
+                            else:
+                                st.metric("Total Patients", 0)
                         with col2:
-                            high_risk = len([s for s in risk_scores.values() if s > 7])
+                            high_risk = len([s for s in risk_scores.values() if s > 7]) if risk_scores else 0
                             st.metric("High Risk Patients", high_risk)
                         with col3:
-                            avg_score = sum(risk_scores.values()) / len(risk_scores) if risk_scores else 0
+                            avg_score = sum(risk_scores.values()) / len(risk_scores) if risk_scores and len(risk_scores) > 0 else 0
                             st.metric("Average Risk Score", f"{avg_score:.2f}")
                         with col4:
                             # Calculate average mortality risk
-                            avg_mortality = sum(mortality_risks.values()) / len(mortality_risks) if mortality_risks else 0
+                            avg_mortality = sum(mortality_risks.values()) / len(mortality_risks) if mortality_risks and len(mortality_risks) > 0 else 0
                             st.metric("Avg Mortality Risk", f"{avg_mortality:.1f}%")
                             
                         with tabs[1]:  # Network Analysis tab
                             st.subheader("Condition Network Analysis")
-                            G = analysis_results.get('G')
+                            G = analysis_results.get('network')  # Changed from 'G' to 'network'
                             domain_df = analysis_results.get('domain_df')
                             
                             if G is not None and G.number_of_nodes() > 0:
@@ -3040,37 +3137,19 @@ def main():
                                     st.plotly_chart(network_fig, use_container_width=True)
                                 
                                 # Display network metrics
-                                network_metrics = analysis_results.get('network_metrics', {})
                                 st.subheader("Network Metrics")
                                 metrics_cols = st.columns(4)
                                 with metrics_cols[0]:
-                                    st.metric("Nodes", network_metrics.get('node_count', 0))
+                                    st.metric("Nodes", G.number_of_nodes())
                                 with metrics_cols[1]:
-                                    st.metric("Edges", network_metrics.get('edge_count', 0))
+                                    st.metric("Edges", G.number_of_edges())
                                 with metrics_cols[2]:
-                                    st.metric("Communities", network_metrics.get('communities', 0))
+                                    # We don't have communities calculated directly anymore
+                                    st.metric("Connected Components", nx.number_connected_components(G))
                                 with metrics_cols[3]:
-                                    st.metric("Density", f"{network_metrics.get('density', 0):.3f}")
-                                    
-                                # Display correlation analysis if calculated
-                                if 'correlation_matrix' in analysis_results:
-                                    st.subheader("Condition Correlations")
-                                    corr_matrix = analysis_results.get('correlation_matrix')
-                                    # Display heatmap of top correlations
-                                    if not corr_matrix.empty:
-                                        # Get top 20 conditions by degree centrality
-                                        top_conditions = sorted(degree_cent.items(), key=lambda x: x[1], reverse=True)[:20]
-                                        top_condition_names = [c[0] for c in top_conditions]
-                                        
-                                        # Filter correlation matrix to these conditions
-                                        top_corr = corr_matrix.loc[top_condition_names, top_condition_names]
-                                        
-                                        fig = px.imshow(top_corr, 
-                                                     x=top_corr.columns, 
-                                                     y=top_corr.index,
-                                                     color_continuous_scale='RdBu_r', 
-                                                     zmin=-1, zmax=1)
-                                        st.plotly_chart(fig, use_container_width=True)
+                                    st.metric("Density", f"{nx.density(G):.3f}")
+                            else:
+                                st.info("No network data available for visualization.")
                             
                         with tabs[2]:  # Risk Analysis tab
                             st.subheader("Risk Score Analysis")
@@ -3149,212 +3228,61 @@ def main():
                         elif view_type == 'Single Patient Analysis':
                             st.subheader("Single Patient Analysis")
                             # Display patient selection and details
-                            patient_ids = analysis_results.get('combined_df')['patient_id'].unique()
-                            if len(patient_ids) > 0:
-                                selected_patient = st.selectbox("Select Patient for Detailed Analysis:", 
-                                                             options=patient_ids)
-                                
-                                # Get patient data
-                                patient_data = analysis_results.get('patient_results').get(selected_patient, {})
-                                patient_risk = {
-                                    'total_score': analysis_results.get('risk_scores', {}).get(selected_patient, 0),
-                                    'mortality_risk_10yr': analysis_results.get('mortality_risks', {}).get(selected_patient, 0),
-                                    'hospitalization_risk_5yr': analysis_results.get('hospitalization_risks', {}).get(selected_patient, 0),
-                                    'domain_scores': analysis_results.get('domain_scores', {}).get(selected_patient, {})
-                                }
-                                
-                                # Use tabs for better organization of patient details
-                                patient_tabs = st.tabs(["Patient Info", "Risk Scores", "Population Comparison"])
-                                
-                                with patient_tabs[0]:  # Patient Info tab
-                                    col1, col2 = st.columns(2)
-                                    with col1:
-                                        st.subheader("Patient Information")
-                                        st.write(f"Patient ID: {selected_patient}")
-                                        st.write(f"Age: {patient_data.get('age', 'Unknown')}")
-                                        st.write(f"Gender: {patient_data.get('gender', 'Unknown')}")
+                            combined_df = analysis_results.get('combined_df')
+                            
+                            if combined_df is not None and not combined_df.empty:
+                                patient_ids = combined_df['patient_id'].unique()
+                                if len(patient_ids) > 0:
+                                    selected_patient = st.selectbox("Select Patient for Detailed Analysis:", 
+                                                                 options=patient_ids)
                                     
-                                    with col2:
-                                        # Display network metrics for this patient
-                                        st.subheader("Network Position")
-                                        network_metrics = patient_data.get('network_metrics', {})
-                                        st.write(f"Degree Centrality: {network_metrics.get('degree_centrality', 0):.3f}")
-                                        st.write(f"Betweenness Centrality: {network_metrics.get('betweenness_centrality', 0):.3f}")
+                                    # Get patient data
+                                    patient_info = {
+                                        'patient_id': selected_patient,
+                                        'age': combined_df[combined_df['patient_id'] == selected_patient]['age'].iloc[0] if 'age' in combined_df.columns else 0,
+                                        'gender': combined_df[combined_df['patient_id'] == selected_patient]['gender'].iloc[0] if 'gender' in combined_df.columns else 'Unknown',
+                                        'total_score': analysis_results.get('risk_scores', {}).get(selected_patient, 0),
+                                        'mortality_risk_10yr': analysis_results.get('mortality_risks', {}).get(selected_patient, 0),
+                                        'hospitalization_risk_5yr': analysis_results.get('hospitalization_risks', {}).get(selected_patient, 0),
+                                        'domain_scores': analysis_results.get('domain_scores', {}).get(selected_patient, {})
+                                    }
                                     
-                                    # Display conditions
-                                    st.subheader("Conditions")
-                                    conditions = patient_data.get('conditions', [])
-                                    if conditions:
-                                        # Organize by domain
-                                        domain_conditions = defaultdict(list)
-                                        for condition in conditions:
-                                            domain = assign_clinical_domain(condition)
-                                            domain_conditions[domain].append(condition)
-                                        
-                                        # Display by domain with expanders
-                                        for domain, conditions_list in domain_conditions.items():
-                                            with st.expander(f"{domain.replace('_', ' ').title()} ({len(conditions_list)} conditions)"):
-                                                for condition in conditions_list:
-                                                    st.write(f"- {condition}")
-                                    else:
-                                        st.write("No conditions recorded for this patient.")
+                                    # Display patient info
+                                    st.write(f"**Patient ID:** {selected_patient}")
+                                    st.write(f"**Age:** {patient_info['age']}")
+                                    st.write(f"**Gender:** {patient_info['gender']}")
                                     
-                                    # Display biomarkers if available
-                                    biomarkers = patient_data.get('biomarkers', {})
-                                    if biomarkers:
-                                        st.subheader("Biomarkers")
-                                        biomarker_df = pd.DataFrame({
-                                            'Biomarker': biomarkers.keys(),
-                                            'Value': biomarkers.values()
+                                    # Display risk scores
+                                    risk_cols = st.columns(3)
+                                    with risk_cols[0]:
+                                        st.metric("Total Risk Score", f"{patient_info['total_score']:.1f}")
+                                    with risk_cols[1]:
+                                        st.metric("10yr Mortality Risk", f"{patient_info['mortality_risk_10yr']:.1f}%")
+                                    with risk_cols[2]:
+                                        st.metric("5yr Hospitalization Risk", f"{patient_info['hospitalization_risk_5yr']:.1f}%")
+                                    
+                                    # Display domain scores
+                                    st.subheader("Clinical Domain Risks")
+                                    domain_scores = patient_info['domain_scores']
+                                    if domain_scores:
+                                        # Create a bar chart for domain scores
+                                        domain_df = pd.DataFrame({
+                                            'Domain': list(domain_scores.keys()),
+                                            'Score': list(domain_scores.values())
                                         })
-                                        st.dataframe(biomarker_df)
-                                    
-                                    with patient_tabs[1]:  # Risk Scores tab
-                                        st.subheader("Risk Assessment")
+                                        domain_df = domain_df.sort_values('Score', ascending=False)
                                         
-                                        # Risk metrics
-                                        risk_cols = st.columns(3)
-                                        with risk_cols[0]:
-                                            st.metric("NHCRS Score", f"{patient_risk['total_score']:.1f}")
-                                        with risk_cols[1]:
-                                            st.metric("10-Year Mortality Risk", f"{patient_risk['mortality_risk_10yr']:.1f}%")
-                                        with risk_cols[2]:
-                                            st.metric("5-Year Hospitalization Risk", f"{patient_risk['hospitalization_risk_5yr']:.1f}%")
-                                        
-                                        # Domain scores visualization
-                                        if patient_risk['domain_scores']:
-                                            domain_scores_df = pd.DataFrame({
-                                                'Domain': list(patient_risk['domain_scores'].keys()),
-                                                'Score': list(patient_risk['domain_scores'].values())
-                                            })
-                                            
-                                            domain_fig = px.bar(domain_scores_df, x='Domain', y='Score',
-                                                              color='Score', color_continuous_scale='Reds',
-                                                              title="Patient Domain Risk Scores")
-                                            st.plotly_chart(domain_fig, use_container_width=True)
-                                            
-                                            # Radar chart for domain visualization
-                                            domains = list(patient_risk['domain_scores'].keys())
-                                            scores = list(patient_risk['domain_scores'].values())
-                                            
-                                            # Close the loop for radar chart
-                                            domains.append(domains[0])
-                                            scores.append(scores[0])
-                                            
-                                            radar_fig = go.Figure()
-                                            radar_fig.add_trace(go.Scatterpolar(
-                                                r=scores,
-                                                theta=domains,
-                                                fill='toself',
-                                                name='Patient Domain Scores'
-                                            ))
-                                            
-                                            radar_fig.update_layout(
-                                                polar=dict(
-                                                    radialaxis=dict(
-                                                        visible=True,
-                                                        range=[0, 10]
-                                                    )
-                                                ),
-                                                title="Domain Risk Profile"
-                                            )
-                                            st.plotly_chart(radar_fig, use_container_width=True)
-                                    
-                                    with patient_tabs[2]:  # Population Comparison tab
-                                        st.subheader("Patient vs Population Comparison")
-                                        
-                                        # Risk score comparison
-                                        risk_scores = analysis_results.get('risk_scores', {})
-                                        mortality_risks = analysis_results.get('mortality_risks', {})
-                                        avg_score = sum(risk_scores.values()) / len(risk_scores) if risk_scores else 0
-                                        avg_mortality = sum(mortality_risks.values()) / len(mortality_risks) if mortality_risks else 0
-                                        
-                                        compare_cols = st.columns(3)
-                                        with compare_cols[0]:
-                                            patient_score = patient_risk['total_score']
-                                            delta = f"{patient_score - avg_score:.2f}"
-                                            st.metric("Risk Score", f"{patient_score:.2f}", delta=delta, 
-                                                    delta_color="inverse")
-                                            
-                                        with compare_cols[1]:
-                                            patient_mortality = patient_risk['mortality_risk_10yr']
-                                            delta_m = f"{patient_mortality - avg_mortality:.1f}%"
-                                            st.metric("Mortality Risk", f"{patient_mortality:.1f}%", delta=delta_m,
-                                                    delta_color="inverse")
-                                            
-                                        with compare_cols[2]:
-                                            # Domain count comparison
-                                            patient_domains = len(patient_risk['domain_scores'])
-                                            domain_scores = analysis_results.get('domain_scores', {})
-                                            avg_domains = sum(len(d) for d in domain_scores.values()) / len(patient_ids)
-                                            delta_d = f"{patient_domains - avg_domains:.1f}"
-                                            st.metric("Clinical Domains", patient_domains, delta=delta_d,
-                                                    delta_color="inverse")
-                                        
-                                        # Domain comparison chart
-                                        if patient_risk['domain_scores']:
-                                            st.subheader("Domain Score Comparison")
-                                            # Get average domain scores across population
-                                            all_domain_scores = analysis_results.get('domain_scores', {})
-                                            avg_domain_scores = {}
-                                            for domain in patient_risk['domain_scores'].keys():
-                                                domain_values = [scores.get(domain, 0) for scores in all_domain_scores.values()]
-                                                avg_domain_scores[domain] = sum(domain_values) / len(domain_values) if domain_values else 0
-                                            
-                                            # Create comparison dataframe
-                                            compare_df = pd.DataFrame({
-                                                'Domain': list(patient_risk['domain_scores'].keys()),
-                                                'Patient Score': list(patient_risk['domain_scores'].values()),
-                                                'Population Average': [avg_domain_scores.get(d, 0) for d in patient_risk['domain_scores'].keys()]
-                                            })
-                                            
-                                            # Create comparison chart
-                                            domain_compare = px.bar(compare_df, x='Domain', y=['Patient Score', 'Population Average'], 
-                                                               barmode='group', title="Domain Score Comparison")
-                                            st.plotly_chart(domain_compare, use_container_width=True)
-                                        
-                                        # Percentile rank information
-                                        st.subheader("Patient Percentile Ranks")
-                                        
-                                        # Calculate percentile for this patient's risk score
-                                        all_scores = list(risk_scores.values())
-                                        all_scores.sort()
-                                        patient_score = patient_risk['total_score']
-                                        percentile = sum(1 for s in all_scores if s < patient_score) / len(all_scores) * 100
-                                        
-                                        st.write(f"This patient's risk score is higher than {percentile:.1f}% of the population.")
-                                        
-                                        # Visualize position in population
-                                        fig = px.histogram(all_scores, 
-                                                        title="Patient Position in Population Distribution",
-                                                        labels={'value': 'Risk Score', 'count': 'Number of Patients'})
-                                        fig.add_vline(x=patient_score, line_width=3, line_dash="dash", line_color="red")
-                                        fig.add_annotation(x=patient_score, y=0, 
-                                                        text=f"Patient: {patient_score:.1f}",
-                                                        showarrow=True, arrowhead=1)
+                                        fig = px.bar(domain_df, x='Domain', y='Score',
+                                                   labels={'Score': 'Risk Score', 'Domain': 'Clinical Domain'},
+                                                   color='Score',
+                                                   color_continuous_scale='Reds')
                                         st.plotly_chart(fig, use_container_width=True)
-                                    
-                                    # Generate AI recommendations if API key available
-                                    if 'openai_api_key' in st.session_state:
-                                        if st.button("Generate AI Clinical Recommendations"):
-                                            with st.spinner("Generating AI recommendations..."):
-                                                recommendations = generate_clinical_recommendations(patient_data, patient_risk)
-                                                st.subheader("AI Clinical Recommendations")
-                                                st.write(recommendations)
-                                                
-                                                # Store recommendations for PDF
-                                                st.session_state.recommendations = recommendations
-                                    
-                                    # PDF generation
-                                    if st.button("Generate PDF Report"):
-                                        with st.spinner("Generating PDF report..."):
-                                            recommendations = st.session_state.get('recommendations', None)
-                                            pdf_bytes = generate_pdf_report(patient_data, patient_risk, recommendations)
-                                            
-                                            # Create download button
-                                            b64_pdf = base64.b64encode(pdf_bytes).decode()
-                                            href = f'<a href="data:application/pdf;base64,{b64_pdf}" download="patient_{selected_patient}_report.pdf">Download PDF Report</a>'
-                                            st.markdown(href, unsafe_allow_html=True)
+                                    else:
+                                        st.info("No domain scores available for this patient.")
+                                else:
+                                    st.warning("No patients found in the analysis results.")
+                            else:
+                                st.warning("No patient data available for analysis.")
                             
     # FHIR Integration
     else:
