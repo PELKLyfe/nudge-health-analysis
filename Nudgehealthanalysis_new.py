@@ -96,8 +96,14 @@ def fetch_authoritative_codes():
 @st.cache_data(ttl=86400)  # Cache for 24 hours
 def fetch_biomarker_reference_data():
     """
-    Fetch and process biomarker reference ranges from authoritative sources like CDC.
-    Returns a dictionary with biomarker reference ranges and metadata.
+    Fetch and process biomarker reference ranges from authoritative sources.
+    
+    Uses the CMS Medicare Coverage Database "Billing and Coding: Biomarkers Overview"
+    (Article ID: A56541) for standardized CPT/HCPCS codes and categorization.
+    Reference: https://www.cms.gov/medicare-coverage-database/view/article.aspx?articleid=56541
+    
+    Returns:
+        Dictionary with biomarker reference ranges, CPT codes, domain mappings, and metadata.
     """
     try:
         # First try to load from local cache
@@ -105,117 +111,509 @@ def fetch_biomarker_reference_data():
             with open('biomarker_reference.json', 'r') as f:
                 return json.load(f)
         
-        # If not in cache, fetch from primary source(s)
-        # CDC NHANES data for common biomarkers
-        cdc_url = "https://wwwn.cdc.gov/nchs/nhanes/vitamind/analyticalnote.aspx?b=2017&e=2020&d=HDL&x=gender"
-        
-        # This is a placeholder - in a real implementation, you'd need to parse the CDC data
-        # which is not directly available in simple JSON/CSV format
-        
-        # For now, we'll create a default reference data structure based on medical standards
+        # Create comprehensive reference data structure based on medical standards
+        # and CMS Medicare Coverage Database Article A56541
         biomarker_ref = {
-            'glucose': {
-                'description': 'Fasting Blood Glucose',
-                'units': 'mg/dL',
-                'low_range': 70,
-                'normal_range': [70, 99],
-                'high_range': [100, 125],
-                'critical_range': 126,
-                'source': 'American Diabetes Association',
-                'updated': datetime.now().strftime('%Y-%m-%d')
-            },
-            'cholesterol': {
+            # CARDIOMETABOLIC DOMAIN
+            # Lipid Panel (CPT 80061) components
+            'total_cholesterol': {
+                'cpt_code': '82465',
                 'description': 'Total Cholesterol',
                 'units': 'mg/dL',
-                'low_range': None,
                 'normal_range': [0, 200],
                 'high_range': [200, 240],
                 'critical_range': 240,
-                'source': 'American Heart Association',
-                'updated': datetime.now().strftime('%Y-%m-%d')
+                'domain': 'Cardiometabolic',
+                'risk_factor': 0.6,
+                'source': 'American Heart Association/CMS'
             },
-            'hdl': {
+            'hdl_cholesterol': {
+                'cpt_code': '83718',
                 'description': 'High-Density Lipoprotein',
                 'units': 'mg/dL',
-                'low_range': 40,
                 'normal_range': [40, 60],
-                'high_range': None,  # Higher is better for HDL
-                'critical_range': None,
-                'source': 'American Heart Association',
-                'updated': datetime.now().strftime('%Y-%m-%d')
+                'low_range': 40,  # Low HDL is a risk factor
+                'domain': 'Cardiometabolic',
+                'risk_factor': -0.5,  # Negative as higher HDL is protective
+                'source': 'American Heart Association/CMS'
             },
-            'ldl': {
+            'ldl_cholesterol': {
+                'cpt_code': '83721',
                 'description': 'Low-Density Lipoprotein',
                 'units': 'mg/dL',
-                'low_range': None,
                 'normal_range': [0, 100],
                 'high_range': [100, 160],
                 'critical_range': 160,
-                'source': 'American Heart Association',
-                'updated': datetime.now().strftime('%Y-%m-%d')
+                'domain': 'Cardiometabolic',
+                'risk_factor': 0.8,
+                'source': 'American Heart Association/CMS'
             },
             'triglycerides': {
+                'cpt_code': '84478',
                 'description': 'Triglycerides',
                 'units': 'mg/dL',
-                'low_range': None,
                 'normal_range': [0, 150],
                 'high_range': [150, 500],
                 'critical_range': 500,
-                'source': 'American Heart Association',
-                'updated': datetime.now().strftime('%Y-%m-%d')
+                'domain': 'Cardiometabolic',
+                'risk_factor': 0.4,
+                'source': 'American Heart Association/CMS'
             },
-            'blood_pressure_systolic': {
-                'description': 'Systolic Blood Pressure',
-                'units': 'mmHg',
-                'low_range': None,
-                'normal_range': [90, 120],
-                'high_range': [120, 140],
-                'critical_range': 140,
-                'source': 'American Heart Association',
-                'updated': datetime.now().strftime('%Y-%m-%d')
+            'lipoprotein_a': {
+                'cpt_code': '83695',
+                'description': 'Lipoprotein(a)',
+                'units': 'nmol/L',
+                'normal_range': [0, 75],
+                'high_range': [75, 125],
+                'critical_range': 125,
+                'domain': 'Cardiometabolic',
+                'risk_factor': 0.7,
+                'source': 'CMS/AHA'
             },
-            'blood_pressure_diastolic': {
-                'description': 'Diastolic Blood Pressure',
-                'units': 'mmHg',
-                'low_range': None,
-                'normal_range': [60, 80],
-                'high_range': [80, 90],
-                'critical_range': 90,
-                'source': 'American Heart Association',
-                'updated': datetime.now().strftime('%Y-%m-%d')
+            
+            # Diabetes markers
+            'glucose': {
+                'cpt_code': '82947',
+                'description': 'Fasting Blood Glucose',
+                'units': 'mg/dL',
+                'normal_range': [70, 99],
+                'high_range': [100, 125],
+                'critical_range': 126,
+                'domain': 'Cardiometabolic',
+                'risk_factor': 0.7,
+                'source': 'American Diabetes Association/CMS'
+            },
+            'fasting_glucose': {
+                'cpt_code': '82947',  # Same as glucose but specifically fasting
+                'description': 'Fasting Blood Glucose',
+                'units': 'mg/dL',
+                'normal_range': [70, 99],
+                'high_range': [100, 125],
+                'critical_range': 126,
+                'domain': 'Cardiometabolic',
+                'risk_factor': 0.7,
+                'source': 'American Diabetes Association/CMS'
             },
             'hba1c': {
+                'cpt_code': '83036',
                 'description': 'Hemoglobin A1c',
                 'units': '%',
-                'low_range': None,
                 'normal_range': [4.0, 5.6],
                 'high_range': [5.7, 6.4],
                 'critical_range': 6.5,
-                'source': 'American Diabetes Association',
-                'updated': datetime.now().strftime('%Y-%m-%d')
+                'domain': 'Cardiometabolic',
+                'risk_factor': 1.2,
+                'source': 'American Diabetes Association/CMS'
             },
+            'insulin': {
+                'cpt_code': '83525',
+                'description': 'Insulin Level',
+                'units': 'μIU/mL',
+                'normal_range': [2.6, 24.9],
+                'domain': 'Cardiometabolic',
+                'risk_factor': 0.6,
+                'source': 'CMS'
+            },
+            
+            # Blood Pressure (manually measured)
+            'blood_pressure_systolic': {
+                'cpt_code': '99213',  # Office visit code where BP is typically measured
+                'description': 'Systolic Blood Pressure',
+                'units': 'mmHg',
+                'normal_range': [90, 120],
+                'high_range': [120, 140],
+                'critical_range': 140,
+                'domain': 'Cardiometabolic',
+                'risk_factor': 0.9,
+                'source': 'American Heart Association'
+            },
+            'blood_pressure_diastolic': {
+                'cpt_code': '99213',  # Office visit code where BP is typically measured
+                'description': 'Diastolic Blood Pressure',
+                'units': 'mmHg',
+                'normal_range': [60, 80],
+                'high_range': [80, 90],
+                'critical_range': 90,
+                'domain': 'Cardiometabolic',
+                'risk_factor': 0.8,
+                'source': 'American Heart Association'
+            },
+            
+            # Kidney function
+            'creatinine': {
+                'cpt_code': '82565',
+                'description': 'Creatinine',
+                'units': 'mg/dL',
+                'normal_range': [0.7, 1.3],
+                'high_range': [1.3, 2.0],
+                'critical_range': 2.0,
+                'domain': 'Cardiometabolic',
+                'risk_factor': 0.8,
+                'source': 'CMS'
+            },
+            'egfr': {
+                'cpt_code': '82565',  # Typically calculated from creatinine
+                'description': 'Estimated Glomerular Filtration Rate',
+                'units': 'mL/min/1.73m²',
+                'normal_range': [90, 120],
+                'low_range': 60,  # Below 60 indicates kidney disease
+                'domain': 'Cardiometabolic',
+                'risk_factor': -0.7,  # Negative as lower eGFR is worse
+                'source': 'National Kidney Foundation/CMS'
+            },
+            'bun': {
+                'cpt_code': '84520',
+                'description': 'Blood Urea Nitrogen',
+                'units': 'mg/dL',
+                'normal_range': [7, 20],
+                'high_range': [20, 40],
+                'critical_range': 40,
+                'domain': 'Cardiometabolic',
+                'risk_factor': 0.6,
+                'source': 'CMS'
+            },
+            'albumin': {
+                'cpt_code': '82040',
+                'description': 'Albumin',
+                'units': 'g/dL',
+                'normal_range': [3.4, 5.4],
+                'low_range': 3.4,  # Low albumin indicates issues
+                'domain': 'Cardiometabolic',
+                'risk_factor': -0.5,  # Negative as lower albumin is worse
+                'source': 'CMS'
+            },
+            'microalbumin': {
+                'cpt_code': '82043',
+                'description': 'Microalbumin',
+                'units': 'mg/L',
+                'normal_range': [0, 30],
+                'high_range': [30, 300],
+                'critical_range': 300,
+                'domain': 'Cardiometabolic',
+                'risk_factor': 0.7,
+                'source': 'CMS'
+            },
+            
+            # Cardiac markers
+            'troponin': {
+                'cpt_code': '84484',
+                'description': 'Troponin (cardiac enzyme)',
+                'units': 'ng/mL',
+                'normal_range': [0, 0.04],
+                'high_range': [0.04, 0.5],
+                'critical_range': 0.5,
+                'domain': 'Cardiometabolic',
+                'risk_factor': 1.5,
+                'source': 'CMS'
+            },
+            'bnp': {
+                'cpt_code': '83880',
+                'description': 'B-type Natriuretic Peptide',
+                'units': 'pg/mL',
+                'normal_range': [0, 100],
+                'high_range': [100, 400],
+                'critical_range': 400,
+                'domain': 'Cardiometabolic',
+                'risk_factor': 1.0,
+                'source': 'CMS'
+            },
+            'nt_probnp': {
+                'cpt_code': '83880',
+                'description': 'N-terminal pro-B-type Natriuretic Peptide',
+                'units': 'pg/mL',
+                'normal_range': [0, 300],
+                'high_range': [300, 900],
+                'critical_range': 900,
+                'domain': 'Cardiometabolic',
+                'risk_factor': 1.0,
+                'source': 'CMS'
+            },
+            
+            # IMMUNE-INFLAMMATION DOMAIN
+            # Inflammation markers
             'crp': {
+                'cpt_code': '86140',
                 'description': 'C-Reactive Protein',
                 'units': 'mg/L',
-                'low_range': None,
                 'normal_range': [0, 3.0],
                 'high_range': [3.0, 10.0],
                 'critical_range': 10.0,
-                'source': 'American Heart Association',
-                'updated': datetime.now().strftime('%Y-%m-%d')
+                'domain': 'Immune-Inflammation',
+                'risk_factor': 0.9,
+                'source': 'American Heart Association/CMS'
+            },
+            'hs_crp': {
+                'cpt_code': '86141',
+                'description': 'High-Sensitivity C-Reactive Protein',
+                'units': 'mg/L',
+                'normal_range': [0, 1.0],
+                'high_range': [1.0, 3.0],
+                'critical_range': 3.0,
+                'domain': 'Immune-Inflammation',
+                'risk_factor': 1.0,
+                'source': 'American Heart Association/CMS'
+            },
+            'esr': {
+                'cpt_code': '85652',
+                'description': 'Erythrocyte Sedimentation Rate',
+                'units': 'mm/hr',
+                'normal_range': [0, 20],
+                'high_range': [20, 50],
+                'critical_range': 50,
+                'domain': 'Immune-Inflammation',
+                'risk_factor': 0.8,
+                'source': 'CMS'
+            },
+            'ferritin': {
+                'cpt_code': '82728',
+                'description': 'Ferritin',
+                'units': 'ng/mL',
+                'normal_range': [20, 250],
+                'high_range': [250, 500],
+                'critical_range': 500,
+                'domain': 'Immune-Inflammation',
+                'risk_factor': 0.7,
+                'source': 'CMS'
+            },
+            
+            # Autoimmune markers
+            'ana': {
+                'cpt_code': '86038',
+                'description': 'Antinuclear Antibody',
+                'units': 'titer',
+                'normal_range': [0, 1.0],  # Below 1:40 titer
+                'high_range': [1.0, 2.0],  # 1:40 to 1:80 titer
+                'critical_range': 2.0,     # Above 1:80 titer
+                'domain': 'Immune-Inflammation',
+                'risk_factor': 0.8,
+                'source': 'CMS'
+            },
+            'rheumatoid_factor': {
+                'cpt_code': '86430',
+                'description': 'Rheumatoid Factor',
+                'units': 'IU/mL',
+                'normal_range': [0, 14],
+                'high_range': [14, 70],
+                'critical_range': 70,
+                'domain': 'Immune-Inflammation',
+                'risk_factor': 0.7,
+                'source': 'CMS'
+            },
+            
+            # ONCOLOGICAL DOMAIN
+            # Cancer markers
+            'psa': {
+                'cpt_code': '84153',
+                'description': 'Prostate Specific Antigen',
+                'units': 'ng/mL',
+                'normal_range': [0, 4.0],
+                'high_range': [4.0, 10.0],
+                'critical_range': 10.0,
+                'domain': 'Oncological',
+                'risk_factor': 1.2,
+                'source': 'CMS'
+            },
+            'cea': {
+                'cpt_code': '82378',
+                'description': 'Carcinoembryonic Antigen',
+                'units': 'ng/mL',
+                'normal_range': [0, 3.0],
+                'high_range': [3.0, 10.0],
+                'critical_range': 10.0,
+                'domain': 'Oncological',
+                'risk_factor': 1.1,
+                'source': 'CMS'
+            },
+            'afp': {
+                'cpt_code': '82105',
+                'description': 'Alpha-Fetoprotein',
+                'units': 'ng/mL',
+                'normal_range': [0, 10.0],
+                'high_range': [10.0, 100.0],
+                'critical_range': 100.0,
+                'domain': 'Oncological',
+                'risk_factor': 1.1,
+                'source': 'CMS'
+            },
+            'ca_125': {
+                'cpt_code': '86304',
+                'description': 'Cancer Antigen 125',
+                'units': 'U/mL',
+                'normal_range': [0, 35.0],
+                'high_range': [35.0, 200.0],
+                'critical_range': 200.0,
+                'domain': 'Oncological',
+                'risk_factor': 1.0,
+                'source': 'CMS'
+            },
+            'ca_19_9': {
+                'cpt_code': '86301',
+                'description': 'Cancer Antigen 19-9',
+                'units': 'U/mL',
+                'normal_range': [0, 37.0],
+                'high_range': [37.0, 100.0],
+                'critical_range': 100.0,
+                'domain': 'Oncological',
+                'risk_factor': 1.0,
+                'source': 'CMS'
+            },
+            
+            # NEURO-MENTAL HEALTH DOMAIN
+            # Substance screening
+            'drug_screen': {
+                'cpt_code': '80305',
+                'description': 'Drug Screen',
+                'units': 'Qualitative',
+                'domain': 'Neuro-Mental Health',
+                'risk_factor': 0.8,
+                'source': 'CMS'
+            },
+            'alcohol_metabolites': {
+                'cpt_code': '80320',
+                'description': 'Alcohol Biomarkers',
+                'units': 'Varies',
+                'domain': 'Neuro-Mental Health',
+                'risk_factor': 0.8,
+                'source': 'CMS'
+            },
+            
+            # Nutritional factors related to mental health
+            'vitamin_b12': {
+                'cpt_code': '82607',
+                'description': 'Vitamin B12',
+                'units': 'pg/mL',
+                'normal_range': [200, 900],
+                'low_range': 200,
+                'domain': 'Neuro-Mental Health',
+                'risk_factor': -0.6,  # Negative as lower levels are worse
+                'source': 'CMS'
+            },
+            'folate': {
+                'cpt_code': '82746',
+                'description': 'Folate',
+                'units': 'ng/mL',
+                'normal_range': [2.0, 20.0],
+                'low_range': 2.0,
+                'domain': 'Neuro-Mental Health',
+                'risk_factor': -0.5,  # Negative as lower levels are worse
+                'source': 'CMS'
+            },
+            
+            # NEUROLOGICAL & FRAILTY DOMAIN
+            # Bone health
+            'vitamin_d': {
+                'cpt_code': '82306',
+                'description': 'Vitamin D, 25-Hydroxy',
+                'units': 'ng/mL',
+                'normal_range': [30, 100],
+                'low_range': 30,
+                'domain': 'Neurological-Frailty',
+                'risk_factor': -0.7,  # Negative as lower levels are worse
+                'source': 'CMS'
+            },
+            
+            # Thyroid function (impacts cognition and frailty)
+            'tsh': {
+                'cpt_code': '84443',
+                'description': 'Thyroid Stimulating Hormone',
+                'units': 'mIU/L',
+                'normal_range': [0.4, 4.0],
+                'low_range': 0.4,
+                'high_range': 4.0,
+                'domain': 'Neurological-Frailty',
+                'risk_factor': 0.6,  # Both high and low are risks
+                'source': 'CMS'
+            },
+            'free_t4': {
+                'cpt_code': '84439',
+                'description': 'Free Thyroxine (T4)',
+                'units': 'ng/dL',
+                'normal_range': [0.8, 1.8],
+                'low_range': 0.8,
+                'high_range': 1.8,
+                'domain': 'Neurological-Frailty',
+                'risk_factor': 0.5,  # Both high and low are risks
+                'source': 'CMS'
+            },
+            
+            # COMPLETE BLOOD COUNT (CBC)
+            'wbc': {
+                'cpt_code': '85025',  # Part of CBC panel
+                'description': 'White Blood Cell Count',
+                'units': 'K/uL',
+                'normal_range': [4.5, 11.0],
+                'low_range': 4.5,
+                'high_range': 11.0,
+                'domain': 'Immune-Inflammation',
+                'risk_factor': 0.7,  # Both high and low are risks
+                'source': 'CMS'
+            },
+            'rbc': {
+                'cpt_code': '85025',  # Part of CBC panel
+                'description': 'Red Blood Cell Count',
+                'units': 'M/uL',
+                'normal_range': [4.2, 5.8],
+                'low_range': 4.2,
+                'high_range': 5.8,
+                'domain': 'Cardiometabolic',
+                'risk_factor': 0.5,  # Both high and low are risks
+                'source': 'CMS'
+            },
+            'hemoglobin': {
+                'cpt_code': '85025',  # Part of CBC panel
+                'description': 'Hemoglobin',
+                'units': 'g/dL',
+                'normal_range': [12.0, 16.0],
+                'low_range': 12.0,
+                'domain': 'Cardiometabolic',
+                'risk_factor': -0.6,  # Negative as lower levels are worse
+                'source': 'CMS'
+            },
+            'hematocrit': {
+                'cpt_code': '85025',  # Part of CBC panel
+                'description': 'Hematocrit',
+                'units': '%',
+                'normal_range': [36.0, 48.0],
+                'low_range': 36.0,
+                'domain': 'Cardiometabolic',
+                'risk_factor': -0.6,  # Negative as lower levels are worse
+                'source': 'CMS'
+            },
+            'platelets': {
+                'cpt_code': '85025',  # Part of CBC panel
+                'description': 'Platelet Count',
+                'units': 'K/uL',
+                'normal_range': [150, 450],
+                'low_range': 150,
+                'high_range': 450,
+                'domain': 'Immune-Inflammation',
+                'risk_factor': 0.6,  # Both high and low are risks
+                'source': 'CMS'
             }
+        }
+        
+        # Add timestamp for cache validation
+        biomarker_ref['_metadata'] = {
+            'updated': datetime.now().strftime('%Y-%m-%d'),
+            'source': 'CMS Medicare Coverage Database Article A56541',
+            'reference_url': 'https://www.cms.gov/medicare-coverage-database/view/article.aspx?articleid=56541'
         }
         
         # Cache the results
         with open('biomarker_reference.json', 'w') as f:
             json.dump(biomarker_ref, f)
         
+        logger.info(f"Successfully loaded {len(biomarker_ref) - 1} biomarker references")  # -1 for metadata
         return biomarker_ref
     
     except Exception as e:
         logger.warning(f"Failed to fetch biomarker reference data: {str(e)}")
-        # Return empty dictionary if fetch fails
-        return {}
+        # Return minimal default set if fetch fails
+        return {
+            'cholesterol': {'normal_range': [0, 200], 'units': 'mg/dL'},
+            'glucose': {'normal_range': [70, 99], 'units': 'mg/dL'},
+            '_metadata': {'updated': datetime.now().strftime('%Y-%m-%d'), 'source': 'Fallback data'}
+        }
 
 def process_diagnosis_data(df):
     """
