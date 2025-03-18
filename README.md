@@ -1,17 +1,44 @@
 # Nudge Health Analysis
 
-A comprehensive health data analysis platform that helps healthcare providers analyze patient data for risk stratification and clinical decision support.
+A comprehensive clinical data analysis platform that integrates network analysis, risk scoring, and AI-powered recommendations.
 
 ## Features
 
-- **Comorbidity Analysis**: Analyze patterns in ICD-10 codes to identify comorbidities and risk factors
-- **Biomarker Analysis**: Process and visualize biomarker data to identify clinical trends
-- **Combined Analysis**: Integrate ICD and biomarker data for comprehensive patient risk assessment
-- **Risk Stratification**: Automated risk scoring across multiple clinical domains
-- **AI-Powered Recommendations**: Generate clinical insights based on patient data
-- **PDF Reports**: Create professional patient reports with comprehensive clinical recommendations
-- **FHIR Integration**: Connect to FHIR servers to access patient data
-- **Interactive Visualizations**: Network visualizations to understand complex relationships between conditions
+- Integrated network analysis and risk score calculations
+- Clinical domain analysis and visualization
+- Patient-level risk assessment
+- Population health insights
+- AI-powered clinical recommendations
+- PDF report generation
+
+## Deployment
+
+This app is deployed on Streamlit Cloud. To run locally:
+
+1. Clone the repository
+2. Install dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
+3. Run the app:
+   ```bash
+   streamlit run Nudgehealthanalysis_new.py
+   ```
+
+## Data Requirements
+
+The app accepts two types of input files:
+1. ICD-10 diagnosis data (Excel format)
+2. Biomarker data (Excel format)
+
+Example files are provided in the repository.
+
+## Environment Variables
+
+For AI recommendations, set your OpenAI API key in the Streamlit secrets or as an environment variable:
+```
+OPENAI_API_KEY=your_api_key_here
+```
 
 ## Technology Stack
 
